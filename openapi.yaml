@@ -1,0 +1,1488 @@
+openapi: 3.0.3
+info:
+  title: Beacon API
+  version: "1.0.0"
+  description: |-
+    Beacon is a crisis-damage crowdsourcing backend: anonymous mobile reporters
+    submit building-damage reports (identified only by an `X-Device-Id` header),
+    and authenticated analysts (JWT bearer) verify, dispatch and export them.
+
+    ## Visibility tiers
+    - **Anonymous / public** callers (no JWT) and the authenticated read-only
+      `external_viewer` role see **verified reports only**, in a locked-down
+      *public projection*: coordinates coarsened to 3 decimal places (~110 m),
+      and `submitterId`, `what3words`, `plusCode`, `landmark`, `buildingId`,
+      `gpsAccuracyMeters`, `description`, tasking/operational fields, `modular`
+      and `anonymization` are stripped. Unverified reports return 404 so their
+      existence and position are never leaked.
+    - **Analyst roles** (`field_validator`, `co_analyst`, `regional_analyst`,
+      `crisis_admin`) see all statuses at full precision, limited to the
+      crises in their `crisisScope` (`"*"` = org-wide).
+
+    ## Crisis scoping
+    Where `crisisId` is optional (stats, export), an omitted value resolves to
+    the **newest active crisis** (the same crisis `GET /v1/crises/active`
+    returns), falling back to a seeded default only when no crisis is active.
+
+    ## Admin codes are NOT P-codes
+    The `adm1Pcode` / `adm2Pcode` / `adm3Pcode` JSON fields (and the
+    `admin1_shapeid` / `admin2_shapeid` / `admin3_shapeid` export columns)
+    carry **geoBoundaries shapeIDs** (prefixed `GB:` + shapeID) or illustrative
+    seed codes — they are **NOT official OCHA COD P-codes**. They are a valid
+    join key against the server's own `admin_areas` table, but must not be
+    presented as P-code provenance. An OCHA COD-AB boundary layer is on the
+    roadmap.
+
+    All error responses use a small JSON envelope: `{"error": "<code>",
+    "message": "<human text>"}` (the 409 duplicate adds `existingId`).
+
+    ## Scope
+    This spec documents the **core reporting surface** (submit, list, detail,
+    photos, verification, tasking, exports, stats, crises, building timeline,
+    auth). Supporting routes — `/map/features`, `/tiles/reports/{z}/{x}/{y}`,
+    `/reports/area-groups`, `/reports/latest-per-building`, `/config`,
+    `/crises/{id}/danger-zones`, `/crises/{id}/status`, `/feeds/refresh`,
+    `/profile` — exist in `internal/api/router.go` but are not yet documented
+    here.
+servers:
+  - url: /api
+    description: All routes below are mounted under /api (e.g. POST /api/v1/reports).
+
+tags:
+  - name: auth
+    description: Analyst authentication (JWT bearer).
+  - name: reports
+    description: Submit, list, read and moderate damage reports.
+  - name: photos
+    description: Report photo upload and retrieval.
+  - name: exports
+    description: Bulk interoperable exports (GeoJSON / HXL CSV / GeoPackage / KML / PDNA pivot).
+  - name: stats
+    description: Aggregated crisis statistics.
+  - name: crises
+    description: Crisis events (active, nearby, by id).
+  - name: buildings
+    description: Per-building damage history.
+
+paths:
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Analyst login (email + password → JWT)
+      description: |-
+        Exchanges analyst credentials for a signed JWT and the user profile.
+        Use the token as `Authorization: Bearer <token>` on analyst endpoints.
+        Unknown email and wrong password return the identical 401 (no user
+        enumeration).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        "200":
+          description: Authenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          description: Invalid email or password (`error=invalid_credentials`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/auth/me:
+    get:
+      tags: [auth]
+      operationId: me
+      summary: Current authenticated analyst
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The authenticated analyst account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/reports:
+    post:
+      tags: [reports]
+      operationId: submitReport
+      summary: Submit a damage report (anonymous, idempotent)
+      description: |-
+        Anonymous mobile submission. The `X-Device-Id` header is **required**:
+        it stamps the anonymous submitter (so "My Reports" works without
+        de-anonymizing the reporter) and keys the per-device rate-limit and
+        dedup guards. Requests without it are rejected with 400
+        (`error=device_id_required`).
+
+        **Idempotent re-submit:** `id` is client-supplied and is the
+        idempotency anchor (`idempotencyKey` defaults to `idem-<id>`).
+        Re-POSTing a report whose `id` or `idempotencyKey` is already stored
+        inserts nothing and returns **200** with the stored report — an
+        offline client can safely replay its queue. A first-time insert
+        returns **201**. Replays never trip the rate-limit or dedup guards.
+
+        **Location (nullable lat/lng):** a report has EITHER a resolved point
+        (GPS fix or tapped building footprint) OR is location-unresolved
+        (landmark-only). Send `lat`/`lng` as numbers with
+        `locationResolved: true` (the default when omitted), or
+        `lat: null, lng: null, locationResolved: false` plus a non-empty
+        `landmark`. The server never stores or emits 0,0 (Null Island).
+        `accuracyMeters` is the wire name for GPS fix accuracy; it coalesces
+        with `gpsAccuracyMeters` and `location.gpsAccuracyMeters`.
+
+        **Crisis assignment:** an explicit `crisisId` pins the report; empty
+        or `"auto"` lets the server assign by space+time. With no match the
+        report stays pending (empty `crisisId`) and may seed an emergent
+        crisis proposal.
+
+        **Anti-abuse:** per submitter, at most 5 reports/minute and
+        20 reports/10 minutes (429 `rate_limited`); a building-less pin within
+        25 m and 10 min of the same submitter's previous pin is rejected with
+        409 `duplicate` referencing the existing report id.
+
+        **Modular secondary impacts** (`modular`): the server stores the blob
+        verbatim; the documented wire enums are in the `ModularImpacts`
+        schema (electricity, healthServices, pressingNeeds).
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdRequired'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitReportRequest'
+      responses:
+        "201":
+          description: Report created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+        "200":
+          description: Idempotent replay — the report already existed; the stored document is returned and nothing was inserted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+        "400":
+          description: Malformed JSON (`bad_json`), missing `X-Device-Id` (`device_id_required`) or failed validation (`validation`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "409":
+          description: Near-duplicate of an existing nearby report by the same submitter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DuplicateError'
+        "429":
+          description: Per-device submit rate limit exceeded (`rate_limited`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      tags: [reports]
+      operationId: listReports
+      summary: List reports (analyst console; filter + paginate)
+      description: |-
+        Analyst-only list (any authenticated role; 401 without a token).
+
+        **Scope:** an explicit `crisisId` must be inside the caller's
+        `crisisScope` (403 `out_of_scope` otherwise). With no `crisisId`, an
+        org-wide (`"*"`) analyst lists every crisis; a finitely-scoped analyst
+        lists all crises in their scope.
+
+        **Pagination:** offset (`page` × `pageSize`) or keyset via `cursor`
+        (opaque base64url token from `nextCursor`; when supplied, `page` is
+        ignored). Ordered by `capturedAt` DESC, `id` DESC. `pageSize` is
+        capped at 200.
+
+        The `external_viewer` role is forced to verified-only results in the
+        coarsened public projection.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: crisisId
+          in: query
+          schema: { type: string }
+          description: Restrict to one crisis (must be in the caller's scope).
+        - name: damage
+          in: query
+          schema: { type: string }
+          description: "Comma-separated or repeated damage grades (either vocabulary): none,slight,moderate,severe,destroyed,minimal,partial,complete."
+        - name: verification
+          in: query
+          schema: { type: string }
+          description: "Comma-separated or repeated: pending,verified,flagged."
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Free-text — matches place (substring), id (prefix) or an infrastructure type.
+        - name: mine
+          in: query
+          schema: { type: boolean }
+          description: Only the caller's own reports; requires the `X-Device-Id` header (400 otherwise).
+        - name: buildingId
+          in: query
+          schema: { type: string }
+        - name: adm1Pcode
+          in: query
+          schema: { type: string }
+          description: "Admin-1 code (geoBoundaries shapeID `GB:<id>` or seed code — not an OCHA P-code)."
+        - name: adm2Pcode
+          in: query
+          schema: { type: string }
+          description: Admin-2 code (same provenance caveat).
+        - name: adm3Pcode
+          in: query
+          schema: { type: string }
+          description: Admin-3 code (same provenance caveat).
+        - name: taskStatus
+          in: query
+          schema: { type: string }
+          description: "Comma-separated or repeated: new,triaged,assigned,in_progress,resolved,closed."
+        - name: severity
+          in: query
+          schema: { type: string }
+          description: "Comma-separated or repeated: routine,elevated,life_safety."
+        - name: lifeSafety
+          in: query
+          schema: { type: boolean }
+          description: Only life-safety reports.
+        - name: assignee
+          in: query
+          schema: { type: string }
+        - name: cluster
+          in: query
+          schema: { type: string }
+          description: "One humanitarian cluster: slsc,health,wash,education,food_security,protection,logistics,nutrition,etc,cccm,early_recovery."
+        - $ref: '#/components/parameters/BBox'
+        - name: page
+          in: query
+          schema: { type: integer, default: 0, minimum: 0 }
+          description: Zero-based page index (offset pagination; ignored when `cursor` is set).
+        - name: pageSize
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: Opaque keyset cursor from a previous response's `nextCursor`.
+        - name: X-Device-Id
+          in: header
+          required: false
+          schema: { type: string }
+          description: Required only with `mine=true` (resolves the caller's anonymous submitter identity).
+      responses:
+        "200":
+          description: One page of reports.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListResponse'
+        "400":
+          description: Bad bbox (`bad_bbox`), bad cursor (`bad_cursor`) or `mine=true` without `X-Device-Id` (`validation`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/OutOfScope'
+
+  /v1/reports/export:
+    get:
+      tags: [exports]
+      operationId: exportReports
+      summary: Bulk export (GeoJSON / HXL CSV / GeoPackage / KML / PDNA pivot)
+      description: |-
+        Analyst-only bulk export with exact coordinates and the full
+        per-report row. The read-only `external_viewer` role is **denied
+        (403)** — its read need is served by the coarsened public map
+        endpoints instead. `crisisId` defaults to the newest active crisis.
+
+        **Row formats (geojson / csv / gpkg / kml)** carry the gate field
+        list: `damage_classification` ∈ {Minimal, Partial, Complete} (the
+        canonical 3-tier rollup), raw `damage` grade, `infrastructure_type`,
+        `hazard_type`, `timestamp` (ISO-8601 of capturedAt, UTC), and the
+        secondary-impact fields `electricity`, `health_services`,
+        `pressing_needs` (flattened from the modular blob), plus
+        `possiblyDamaged`, `debris`, `buildingId`, `verification`, `place`,
+        `accuracy_m`, and the `admin1_shapeid` / `admin2_shapeid` /
+        `admin3_shapeid` columns (geoBoundaries shapeIDs / seed codes — NOT
+        OCHA P-codes; their HXL tags use `+id`, never `+code`).
+
+        - `geojson` — FeatureCollection; geometry is a Point `[lng, lat]` in
+          decimal degrees, or `null` for a location-unresolved report (never
+          `[0,0]`).
+        - `csv` — header row + an HXL hashtag row, `latitude`/`longitude`
+          columns blank for unresolved reports.
+        - `gpkg` — OGC GeoPackage (single SQLite file), NULL geometry for
+          unresolved reports.
+        - `kml` — one Placemark per *resolved* report (unresolved skipped).
+        - `pdna` — a different shape: a PDNA-ready **damage-count** pivot
+          (sector × admin-2) of report counts per grade, HXL-tagged CSV. The
+          3-tier rollup (minimal/partial/complete) sums to `total`; the
+          5-level EMS-98 columns are detail only. It is NOT a loss/cost
+          estimation (no monetary figures).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [geojson, csv, gpkg, kml, pdna]
+            default: geojson
+        - name: crisisId
+          in: query
+          schema: { type: string }
+          description: Defaults to the newest active crisis when omitted.
+        - name: damage
+          in: query
+          schema: { type: string }
+          description: Comma-separated or repeated damage grades.
+        - name: verification
+          in: query
+          schema: { type: string }
+          description: "Comma-separated or repeated: pending,verified,flagged."
+        - name: q
+          in: query
+          schema: { type: string }
+        - name: adm2Pcode
+          in: query
+          schema: { type: string }
+        - name: adm3Pcode
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/BBox'
+      responses:
+        "200":
+          description: The export file (Content-Disposition attachment).
+          content:
+            application/geo+json:
+              schema:
+                type: object
+                description: GeoJSON FeatureCollection (format=geojson).
+            text/csv:
+              schema:
+                type: string
+                description: HXL-tagged CSV (format=csv) or PDNA damage-count pivot (format=pdna).
+            application/geopackage+sqlite3:
+              schema:
+                type: string
+                format: binary
+                description: OGC GeoPackage (format=gpkg).
+            application/vnd.google-earth.kml+xml:
+              schema:
+                type: string
+                description: KML document (format=kml).
+        "400":
+          description: Unknown format (`bad_format`) or bad bbox (`bad_bbox`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: external_viewer cannot export raw data (`forbidden`), or the crisis is out of the caller's scope (`out_of_scope`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/reports/{id}:
+    get:
+      tags: [reports]
+      operationId: getReport
+      summary: Get one report (public = verified-only, coarsened; analyst = full)
+      description: |-
+        Public endpoint with tiered projection:
+        - **Anonymous** (and the authenticated `external_viewer`): only a
+          VERIFIED report is returned, in the public projection — coordinates
+          coarsened to 3 decimals (~110 m); `submitterId`, `what3words`,
+          `plusCode`, `landmark`, `buildingId`, `gpsAccuracyMeters`,
+          `description`, tasking fields, `modular` and `anonymization`
+          stripped. An unverified report 404s (its existence is never leaked).
+        - **Analyst roles** in scope for the report's crisis get the full
+          document at full precision (any verification status). An
+          out-of-scope report 404s rather than 403s.
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+      responses:
+        "200":
+          description: The report (full or public projection depending on caller tier).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /v1/reports/{id}/photo:
+    post:
+      tags: [photos]
+      operationId: uploadReportPhoto
+      summary: Upload the report's photo (anonymous, ownership-bound)
+      description: |-
+        Multipart upload (`file` part, max 12 MB). Only real JPEG/PNG/WEBP
+        bytes are accepted (content-sniffed; 415 otherwise). The upload is
+        bound to the report's creator: if the report stored its creating
+        device, the caller's `X-Device-Id` must match (403 otherwise); if no
+        device was recorded, only a FIRST upload (no photo yet) within 30
+        minutes of capture is allowed.
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+        - name: X-Device-Id
+          in: header
+          required: false
+          schema: { type: string }
+          description: Must match the report's creating device when one is recorded.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: JPEG, PNG or WEBP image (max 12 MB).
+      responses:
+        "200":
+          description: Photo stored and recorded on the report.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  photoUrl:
+                    type: string
+                    example: /api/v1/reports/rep-123/photo
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "403":
+          description: Caller is not the reporting device, the photo already exists, or the first-upload window has closed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "415":
+          description: The file is not a JPEG/PNG/WEBP image (`unsupported_media`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      tags: [photos]
+      operationId: getReportPhoto
+      summary: Serve the report's photo (visibility mirrors the report)
+      description: |-
+        Anonymous and `external_viewer` callers receive the photo only when
+        the report is VERIFIED (404 otherwise — never reveals whether the
+        file exists); `external_viewer` must also be in scope for the
+        report's crisis. Analyst roles fetch any status within their crisis
+        scope. Served with `Cache-Control: private`.
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+      responses:
+        "200":
+          description: The image bytes.
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: No such report/photo, or the caller's tier may not see it.
+      security:
+        - {}
+        - bearerAuth: []
+
+  /v1/reports/{id}/verification:
+    patch:
+      tags: [reports]
+      operationId: patchVerification
+      summary: Set a report's verification status (analyst decision)
+      description: |-
+        Mutator endpoint — any analyst role except the read-only
+        `external_viewer` (403 `forbidden`), crisis-scoped: an analyst may
+        only verify reports of crises in their scope (403 `out_of_scope`); a
+        pending report with no crisis is mutable only with org-wide scope.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerificationRequest'
+      responses:
+        "200":
+          description: The updated report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/OutOfScope'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /v1/reports/{id}/task:
+    patch:
+      tags: [reports]
+      operationId: patchTask
+      summary: Advance a report's dispatch task (analyst)
+      description: |-
+        Mutator endpoint (same auth/scope rules as the verification PATCH).
+        Any subset of the body advances the task: status, assignee, severity,
+        cluster routing, disposition, or an audit note.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskRequest'
+      responses:
+        "200":
+          description: The updated report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/OutOfScope'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /v1/buildings/{buildingId}/timeline:
+    get:
+      tags: [buildings]
+      operationId: buildingTimeline
+      summary: A building's damage version history
+      description: |-
+        Public endpoint. For the public tier (anonymous or `external_viewer`)
+        it returns VERIFIED entries only, with each entry's free-text note
+        stripped and the reporter shown as `community`. Analyst roles see the
+        full chain (all statuses, notes, reporter).
+      parameters:
+        - name: buildingId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: The building's version chain.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BuildingTimeline'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /v1/stats/overview:
+    get:
+      tags: [stats]
+      operationId: statsOverview
+      summary: Aggregated crisis statistics (analyst)
+      description: |-
+        All aggregates computed in SQL for one crisis. `crisisId` defaults to
+        the **newest active crisis** when omitted. The caller must be in
+        scope for the resolved crisis (403 `out_of_scope`). For the
+        `external_viewer` role the embedded `recent` list is reduced to
+        verified reports in the public projection.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: crisisId
+          in: query
+          schema: { type: string }
+          description: Defaults to the newest active crisis when omitted.
+      responses:
+        "200":
+          description: The overview aggregates.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsOverview'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/OutOfScope'
+
+  /v1/crises:
+    get:
+      tags: [crises]
+      operationId: listCrises
+      summary: List crises (optionally by status)
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string }
+          description: "Comma-separated lifecycle filter, e.g. `active,proposed`. Statuses: active, proposed, closed, dismissed."
+      responses:
+        "200":
+          description: Crises.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Crisis'
+
+  /v1/crises/active:
+    get:
+      tags: [crises]
+      operationId: activeCrisis
+      summary: The newest active crisis
+      description: Returns the newest active crisis, or 204 when no crisis is active.
+      responses:
+        "200":
+          description: The active crisis.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Crisis'
+        "204":
+          description: No active crisis.
+
+  /v1/crises/near:
+    get:
+      tags: [crises]
+      operationId: nearbyCrises
+      summary: Active/proposed crises near a point (location-first launch)
+      parameters:
+        - name: lat
+          in: query
+          required: true
+          schema: { type: number, minimum: -90, maximum: 90 }
+        - name: lng
+          in: query
+          required: true
+          schema: { type: number, minimum: -180, maximum: 180 }
+        - name: radiusKm
+          in: query
+          schema: { type: number, default: 50 }
+      responses:
+        "200":
+          description: Nearby crises with distance (and whether the point is covered).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Crisis'
+                  count:
+                    type: integer
+        "400":
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/crises/{id}:
+    get:
+      tags: [crises]
+      operationId: getCrisis
+      summary: One crisis by id
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: The crisis.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Crisis'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Analyst JWT issued by POST /v1/auth/login.
+
+  parameters:
+    ReportId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: The report id (client-generated at submit time).
+    DeviceIdRequired:
+      name: X-Device-Id
+      in: header
+      required: true
+      schema: { type: string }
+      description: |-
+        Anonymous device identity. Required to submit: it stamps the
+        anonymous submitter and keys the per-device rate-limit + dedup guards.
+    BBox:
+      name: bbox
+      in: query
+      required: false
+      schema: { type: string }
+      description: "Geographic filter: `minLng,minLat,maxLng,maxLat` (WGS84 decimal degrees)."
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Analyst login required (missing/invalid bearer token).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    OutOfScope:
+      description: The caller's role/scope cannot access or modify this resource (`out_of_scope` / `forbidden`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Resource not found (also returned for resources the caller's tier may not see).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable code (e.g. validation, bad_json, unauthorized, out_of_scope, not_found, rate_limited).
+        message:
+          type: string
+
+    DuplicateError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          enum: [duplicate]
+        message:
+          type: string
+        existingId:
+          type: string
+          description: Id of the pre-existing nearby report so the client can route the user to it.
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password }
+
+    LoginResponse:
+      type: object
+      required: [token, user]
+      properties:
+        token:
+          type: string
+          description: Signed JWT for the Authorization Bearer header.
+        user:
+          $ref: '#/components/schemas/User'
+
+    User:
+      type: object
+      required: [id, email, name, role, crisisScope]
+      properties:
+        id: { type: string }
+        email: { type: string }
+        name: { type: string }
+        role:
+          type: string
+          enum: [field_validator, co_analyst, regional_analyst, crisis_admin, external_viewer]
+          description: external_viewer is read-only and receives the coarsened public projection.
+        region:
+          type: string
+          nullable: true
+        crisisScope:
+          type: array
+          items: { type: string }
+          description: Crisis ids the user may access; `"*"` grants org-wide access.
+
+    PhotoRef:
+      type: object
+      properties:
+        localPath: { type: string }
+        remoteUrl:
+          type: string
+          nullable: true
+        sizeBytes:
+          type: integer
+          format: int64
+
+    ReportLocation:
+      type: object
+      properties:
+        lat:
+          type: number
+          nullable: true
+          description: Null for a location-unresolved (landmark-only) report.
+        lng:
+          type: number
+          nullable: true
+        buildingId:
+          type: string
+          nullable: true
+        what3words:
+          type: string
+          nullable: true
+        plusCode:
+          type: string
+          nullable: true
+        landmark:
+          type: string
+          nullable: true
+        gpsAccuracyMeters:
+          type: number
+          nullable: true
+
+    ReportDescription:
+      type: object
+      properties:
+        original: { type: string }
+        originalLang: { type: string }
+        translated:
+          type: string
+          description: Always emitted in responses; coalesces to the original text when no translation exists.
+        translatedLang:
+          type: string
+          nullable: true
+
+    AdminRef:
+      type: object
+      description: "One administrative level. `pcode` is a geoBoundaries shapeID (`GB:<shapeID>`) or an illustrative seed code — NOT an official OCHA COD P-code."
+      properties:
+        pcode: { type: string }
+        name: { type: string }
+
+    AdminChain:
+      type: object
+      description: Reverse-geocoded ADM0–ADM3 chain stamped on a report (same provenance caveat as AdminRef).
+      properties:
+        adm0: { $ref: '#/components/schemas/AdminRef' }
+        adm1: { $ref: '#/components/schemas/AdminRef' }
+        adm2: { $ref: '#/components/schemas/AdminRef' }
+        adm3: { $ref: '#/components/schemas/AdminRef' }
+
+    Anonymization:
+      type: object
+      description: |-
+        Honest privacy flags. exifStripped is real (mobile strips EXIF on
+        capture); facesBlurred/platesBlurred are NOT implemented and the
+        server forces them to false even if a client claims otherwise.
+      properties:
+        anonymous: { type: boolean }
+        exifStripped: { type: boolean }
+        facesBlurred: { type: boolean }
+        platesBlurred: { type: boolean }
+
+    ModularImpacts:
+      type: object
+      description: |-
+        Modular secondary-impact answers. The server stores this blob
+        verbatim (no strict server-side enum validation); the enums below are
+        the documented wire contract, and the values are flattened into the
+        export columns electricity / health_services / pressing_needs.
+      properties:
+        electricity:
+          type: string
+          nullable: true
+          enum: [none_observed, minor, moderate, severe, destroyed, unknown]
+        healthServices:
+          type: string
+          nullable: true
+          enum: [fully_functional, partially_functional, largely_disrupted, not_functioning, unknown]
+        pressingNeeds:
+          type: array
+          items:
+            type: string
+            enum: [food_water, cash, healthcare, shelter, livelihoods, wash, protection, local_support, other]
+
+    SubmitReportRequest:
+      type: object
+      description: |-
+        Lenient inbound shape: flat lat/lng OR a nested `location`, and
+        `infra`/`crisis` aliases for `infraTypes`/`crisisNature`, so both
+        clients can POST as-is. Constraint: locationResolved=true (the
+        default) requires in-range lat/lng; locationResolved=false requires a
+        non-empty `landmark` (lat/lng must then be null/omitted).
+      required: [id, damage]
+      properties:
+        id:
+          type: string
+          description: Client-supplied id — the idempotency anchor for offline replays.
+        idempotencyKey:
+          type: string
+          description: Defaults to `idem-<id>` when omitted.
+        crisisId:
+          type: string
+          description: Explicit crisis pin; empty or `"auto"` = server assigns by space+time (no match = pending).
+        damage:
+          type: string
+          enum: [none, slight, moderate, severe, destroyed, minimal, partial, complete]
+          description: Either vocabulary — 5-level EMS-98 (none…destroyed) or the 3-tier scale (minimal/partial/complete).
+        possiblyDamaged:
+          type: boolean
+          description: Reporter unsure / resolves the satellite "possibly damaged" class.
+        debris:
+          type: string
+          enum: ["yes", "no", "unsure"]
+          description: Defaults to `unsure` when omitted.
+        infraTypes:
+          type: array
+          items:
+            type: string
+            enum: [residential, commercial, government, utility, transport, community, public, other]
+        infra:
+          type: array
+          items: { type: string }
+          description: Dashboard alias for infraTypes (used when infraTypes is empty).
+        infraOtherDetail:
+          type: string
+          nullable: true
+        crisisNature:
+          type: array
+          items:
+            type: string
+            enum: [earthquake, flood, tsunami, hurricane, wildfire, explosion, chemical, conflict, civil_unrest]
+          description: Defaults to ["earthquake"] when empty.
+        crisis:
+          type: array
+          items: { type: string }
+          description: Alias for crisisNature (used when crisisNature is empty).
+        lat:
+          type: number
+          nullable: true
+          minimum: -90
+          maximum: 90
+          description: Nullable — a landmark-only report sends lat:null, lng:null with locationResolved:false.
+        lng:
+          type: number
+          nullable: true
+          minimum: -180
+          maximum: 180
+        locationResolved:
+          type: boolean
+          nullable: true
+          description: True when a real GPS fix or tapped footprint produced a point; false for landmark-only reports. Defaults to true when omitted (coords must then be present).
+        accuracyMeters:
+          type: number
+          nullable: true
+          description: GPS fix accuracy in meters; coalesces with gpsAccuracyMeters and location.gpsAccuracyMeters into the stored gpsAccuracyMeters.
+        location:
+          allOf:
+            - $ref: '#/components/schemas/ReportLocation'
+          nullable: true
+          description: Nested alternative to the flat lat/lng + location fields.
+        buildingId:
+          type: string
+          nullable: true
+        what3words:
+          type: string
+          nullable: true
+        plusCode:
+          type: string
+          nullable: true
+        landmark:
+          type: string
+          nullable: true
+          description: Required (non-empty) when locationResolved is false.
+        gpsAccuracyMeters:
+          type: number
+          nullable: true
+        place:
+          type: string
+        description:
+          allOf:
+            - $ref: '#/components/schemas/ReportDescription'
+          nullable: true
+        aiLevel:
+          type: string
+          nullable: true
+          description: On-device AI damage suggestion; must be a valid damage value when present.
+        aiConfidence:
+          type: integer
+          nullable: true
+        photos:
+          type: array
+          items:
+            $ref: '#/components/schemas/PhotoRef'
+        sizeBytes:
+          type: integer
+          format: int64
+          nullable: true
+          description: Defaults to the sum of photo sizes when omitted.
+        modular:
+          allOf:
+            - $ref: '#/components/schemas/ModularImpacts'
+          nullable: true
+        anonymization:
+          allOf:
+            - $ref: '#/components/schemas/Anonymization'
+          nullable: true
+        sync:
+          description: Client sync-state blob (stored as-is).
+          nullable: true
+        capturedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Defaults to the server time when omitted.
+        lifeSafety:
+          type: boolean
+          description: Intake life-safety question — true puts the report on the dispatch fast lane (severity=life_safety).
+        clusters:
+          type: array
+          items:
+            type: string
+            enum: [slsc, health, wash, education, food_security, protection, logistics, nutrition, etc, cccm, early_recovery]
+          description: Reporter-suggested humanitarian sector(s).
+
+    Report:
+      type: object
+      description: |-
+        Canonical report document — a superset read by both clients (nested
+        objects + flat aliases coexist). For public-tier callers many fields
+        are stripped/coarsened; see the per-endpoint projection notes.
+      properties:
+        id: { type: string }
+        idempotencyKey: { type: string }
+        crisisId:
+          type: string
+          description: Empty for a pending report not yet assigned to a crisis.
+        submitterId:
+          type: string
+          nullable: true
+          description: Anonymous submitter uuid; omitted in the public projection.
+        damage:
+          type: string
+          enum: [none, slight, moderate, severe, destroyed, minimal, partial, complete]
+          description: Raw grade (3-tier OR 5-level EMS-98, depending on capture scale).
+        damageTier:
+          type: string
+          enum: [minimal, partial, complete]
+          description: The required 3-level rollup; always present.
+        possiblyDamaged: { type: boolean }
+        verification:
+          type: string
+          enum: [pending, verified, flagged]
+        debris:
+          type: string
+          enum: ["yes", "no", "unsure"]
+        infraTypes:
+          type: array
+          items: { type: string }
+        infra:
+          type: array
+          items: { type: string }
+          description: Dashboard alias (same array as infraTypes).
+        infraOtherDetail:
+          type: string
+          nullable: true
+        crisisNature:
+          type: array
+          items: { type: string }
+        crisis:
+          type: array
+          items: { type: string }
+          description: Dashboard alias (same array as crisisNature).
+        lat:
+          type: number
+          nullable: true
+          description: Null for a location-unresolved (landmark-only) report — never 0,0. Coarsened to ~3 decimals (~110 m) in the public projection.
+        lng:
+          type: number
+          nullable: true
+        locationResolved:
+          type: boolean
+          description: True when a real GPS fix or tapped footprint produced the point.
+        gpsAccuracyMeters:
+          type: number
+          nullable: true
+        buildingId:
+          type: string
+          nullable: true
+        what3words:
+          type: string
+          nullable: true
+        plusCode:
+          type: string
+          nullable: true
+        landmark:
+          type: string
+          nullable: true
+        place: { type: string }
+        photoUrl:
+          type: string
+          nullable: true
+          description: Relative URL of the report photo (only advertised publicly when verified).
+        location:
+          $ref: '#/components/schemas/ReportLocation'
+        admin:
+          allOf:
+            - $ref: '#/components/schemas/AdminChain'
+          nullable: true
+        adm1Pcode:
+          type: string
+          nullable: true
+          description: "Flat admin-1 code alias — geoBoundaries shapeID (`GB:<id>`) or seed code, NOT an OCHA P-code."
+        adm2Pcode:
+          type: string
+          nullable: true
+        adm3Pcode:
+          type: string
+          nullable: true
+        version:
+          type: integer
+          description: Per-building version (server-authoritative).
+        supersedesReportId:
+          type: string
+          nullable: true
+        description:
+          allOf:
+            - $ref: '#/components/schemas/ReportDescription'
+          nullable: true
+        aiLevel:
+          type: string
+          nullable: true
+        aiConfidence:
+          type: integer
+          nullable: true
+        photos:
+          type: array
+          items:
+            $ref: '#/components/schemas/PhotoRef'
+        sizeBytes:
+          type: integer
+          format: int64
+        sizeMb: { type: number }
+        modular:
+          allOf:
+            - $ref: '#/components/schemas/ModularImpacts'
+          nullable: true
+        anonymization:
+          $ref: '#/components/schemas/Anonymization'
+        taskStatus:
+          type: string
+          description: "Dispatch stage: new, triaged, assigned, in_progress, resolved, closed (empty in the public projection)."
+        disposition:
+          type: string
+          nullable: true
+          enum: [resolved, cleared_nothing_found, no_action_needed, gone_on_arrival, unfounded, duplicate, referred]
+        assignee:
+          type: string
+          nullable: true
+        taskRef:
+          type: string
+          nullable: true
+        severity:
+          type: string
+          description: "routine, elevated or life_safety (empty in the public projection)."
+        lifeSafety: { type: boolean }
+        clusters:
+          type: array
+          items: { type: string }
+        isMine: { type: boolean }
+        synced: { type: boolean }
+        sync:
+          description: Client sync-state blob (discriminated union), echoed as stored.
+          nullable: true
+        ageMin:
+          type: integer
+          description: Minutes since capture (computed).
+        capturedAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    ListResponse:
+      type: object
+      required: [items, total, grandTotal]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Report'
+        total:
+          type: integer
+          description: Count matching the current filters.
+        grandTotal:
+          type: integer
+          description: Unfiltered count within the list's crisis scope ("showing N of GRAND").
+        nextCursor:
+          type: string
+          nullable: true
+          description: Opaque keyset cursor for the next page; absent on the last page.
+
+    VerificationRequest:
+      type: object
+      required: [verification]
+      properties:
+        verification:
+          type: string
+          enum: [pending, verified, flagged]
+
+    TaskRequest:
+      type: object
+      description: Any subset advances the task; all fields optional.
+      properties:
+        taskStatus:
+          type: string
+          nullable: true
+          enum: [new, triaged, assigned, in_progress, resolved, closed]
+        assignee:
+          type: string
+          nullable: true
+        severity:
+          type: string
+          nullable: true
+          enum: [routine, elevated, life_safety]
+        disposition:
+          type: string
+          nullable: true
+          enum: [resolved, cleared_nothing_found, no_action_needed, gone_on_arrival, unfounded, duplicate, referred]
+        clusters:
+          type: array
+          nullable: true
+          items:
+            type: string
+            enum: [slsc, health, wash, education, food_security, protection, logistics, nutrition, etc, cccm, early_recovery]
+        note:
+          type: string
+          nullable: true
+
+    Crisis:
+      type: object
+      description: A crisis event. Emits both lat/lng (dashboard) and centerLat/centerLng (mobile).
+      properties:
+        id: { type: string }
+        title: { type: string }
+        area: { type: string }
+        nature:
+          type: string
+          description: e.g. earthquake, flood, tsunami, hurricane, wildfire, explosion, chemical, conflict, civil_unrest.
+        lat: { type: number }
+        lng: { type: number }
+        centerLat: { type: number }
+        centerLng: { type: number }
+        source: { type: string }
+        startedAt:
+          type: string
+          format: date-time
+        startedAgoHrs: { type: integer }
+        glide:
+          type: string
+          nullable: true
+          description: Cross-org disaster event key (GLIDE).
+        responseLevel:
+          type: integer
+          nullable: true
+          description: UNDP corporate crisis Level 1/2/3.
+        radiusKm:
+          type: number
+          description: Coverage radius around the center point (km).
+        endedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Null while ongoing.
+        status:
+          type: string
+          enum: [active, proposed, closed, dismissed]
+          description: proposed = emergent cluster awaiting analyst confirmation.
+        responseId:
+          type: string
+          nullable: true
+        reportCount: { type: integer }
+        distanceKm:
+          type: number
+          nullable: true
+          description: Only on /crises/near responses (km from the queried point).
+        covers:
+          type: boolean
+          nullable: true
+          description: Only on /crises/near — true if the queried point is within radiusKm.
+
+    BuildingVersion:
+      type: object
+      properties:
+        reportId: { type: string }
+        v: { type: integer }
+        damage: { type: string }
+        at:
+          type: string
+          format: date-time
+        ageMin: { type: integer }
+        isCurrent: { type: boolean }
+        by:
+          type: string
+          description: Reporter identity; shown as "community" to public-tier callers.
+        note:
+          type: string
+          description: Free-text note; stripped (empty) for public-tier callers.
+
+    BuildingTimeline:
+      type: object
+      properties:
+        buildingId: { type: string }
+        current:
+          type: string
+          nullable: true
+          description: The building's current damage grade.
+        versions:
+          type: array
+          items:
+            $ref: '#/components/schemas/BuildingVersion'
+
+    DamageTierCounts:
+      type: object
+      description: Canonical, vocabulary-agnostic breakdown — minimal+partial+complete always equals totalReports.
+      properties:
+        minimal: { type: integer }
+        partial: { type: integer }
+        complete: { type: integer }
+
+    DamageCounts:
+      type: object
+      description: 5-level EMS-98 detail; only covers ems98-scale reports and does NOT sum to totalReports.
+      properties:
+        none: { type: integer }
+        slight: { type: integer }
+        moderate: { type: integer }
+        severe: { type: integer }
+        destroyed: { type: integer }
+
+    VerificationCounts:
+      type: object
+      properties:
+        verified: { type: integer }
+        pending: { type: integer }
+        flagged: { type: integer }
+
+    TaskCounts:
+      type: object
+      properties:
+        new: { type: integer }
+        triaged: { type: integer }
+        assigned: { type: integer }
+        in_progress: { type: integer }
+        resolved: { type: integer }
+        closed: { type: integer }
+
+    TimeBucket:
+      type: object
+      properties:
+        hour: { type: integer }
+        count: { type: integer }
+
+    AreaGroup:
+      type: object
+      properties:
+        area: { type: string }
+        count: { type: integer }
+        worst:
+          type: string
+          description: Worst raw grade (either vocabulary), ranked by its 3-tier rollup.
+        worstTier:
+          type: string
+          enum: [minimal, partial, complete]
+
+    StatsOverview:
+      type: object
+      properties:
+        totalReports: { type: integer }
+        damageTierCounts:
+          $ref: '#/components/schemas/DamageTierCounts'
+        damageCounts:
+          $ref: '#/components/schemas/DamageCounts'
+        verificationCounts:
+          $ref: '#/components/schemas/VerificationCounts'
+        syncedCount: { type: integer }
+        syncedPct: { type: integer }
+        completePct:
+          type: integer
+          description: Percent in the complete tier (tier-3 complete / EMS-98 destroyed).
+        destroyedPct:
+          type: integer
+          description: Alias of completePct (kept for dashboard compatibility).
+        severePlusPct:
+          type: integer
+          description: Percent in partial+complete tiers (the "heavy damage" headline).
+        taskCounts:
+          $ref: '#/components/schemas/TaskCounts'
+        lifeSafetyOpen:
+          type: integer
+          description: Open life-safety tasks (fast lane).
+        areas:
+          type: array
+          items:
+            $ref: '#/components/schemas/AreaGroup'
+        timeSeries:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimeBucket'
+        recent:
+          type: array
+          items:
+            $ref: '#/components/schemas/Report'
+          description: Most recent reports; reduced to verified-only public projections for the external_viewer role.

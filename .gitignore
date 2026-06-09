@@ -1,0 +1,12 @@
+# Secrets — never commit. Holds the live POSTGRES_PASSWORD / JWT_SECRET that
+# docker-compose.yml interpolates. Use .env.example as the template.
+.env
+.env.*
+!.env.example
+
+# Build output
+/bin/
+*.test
+
+# Local data (uploaded photos, etc.)
+/data/

@@ -1,0 +1,72 @@
+# Production compose for the stepanok.com server (Traefik + Let's Encrypt).
+# Routed at https://beacon-api.stepanok.com. For LOCAL development use
+# docker-compose.dev.yml (host ports, no Traefik): `make db` / `make run`.
+#
+# Secrets (POSTGRES_PASSWORD, the password in DATABASE_URL, JWT_SECRET) are NOT
+# committed: they are interpolated from backend/.env (gitignored). Copy
+# .env.example -> .env and fill in the real values on the deploy host.
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: beacon-api-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: beacon
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: beacon
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U beacon -d beacon"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - beacon-pg:/var/lib/postgresql/data
+    networks:
+      - internal
+
+  app:
+    build: .
+    container_name: beacon-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # DB is reachable only on the private 'internal' Docker network (never exposed
+      # to the host/web), so sslmode=prefer: use TLS if the server offers it, else
+      # plaintext over the private bridge — works with or without DB TLS configured.
+      DATABASE_URL: "postgres://beacon:${POSTGRES_PASSWORD}@db:5432/beacon?sslmode=prefer"
+      HTTP_ADDR: ":8080"
+      ENV: prod
+      RUN_SEED: "false"
+      SEED_DATASET: both
+      JWT_SECRET: "${JWT_SECRET}"
+      CORS_ORIGINS: "https://beacon.stepanok.com,https://beacon-help.stepanok.com"
+      LOG_LEVEL: info
+      PGX_MAX_CONNS: "10"
+      PHOTO_DIR: /data/photos
+      FEEDS_ENABLED: "true"
+      FEEDS_INTERVAL_MIN: "30"
+      TRANSLATE_URL: "http://beacon-libretranslate:5000"
+      TRANSLATE_TARGET: "en"
+    volumes:
+      - beacon-photos:/data/photos
+    networks:
+      - web
+      - internal
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.beacon-api.rule=Host(`beacon-api.stepanok.com`)"
+      - "traefik.http.routers.beacon-api.entrypoints=websecure"
+      - "traefik.http.routers.beacon-api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.beacon-api.loadbalancer.server.port=8080"
+
+networks:
+  web:
+    external: true
+  internal:
+    driver: bridge
+
+volumes:
+  beacon-pg:
+  beacon-photos:
