@@ -7,7 +7,7 @@ import (
 	"github.com/stepanok/beacon-server/internal/store"
 )
 
-// GET /api/v1/reports/export?format=geojson|csv|gpkg|kml
+// GET /api/v1/reports/export?format=geojson|csv|gpkg|kml|shapefile
 //
 // Bulk export carries exact coordinates + the full per-report row (incl. building
 // ids and operational columns), so it is restricted to the REAL analyst roles
@@ -86,7 +86,17 @@ func (h *Handlers) ExportReports(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Disposition", `attachment; filename="beacon-reports.kml"`)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(service.ToKML(reports))
+	case "shapefile", "shp":
+		body, err := service.ToShapefile(reports)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "internal", "shapefile build failed")
+			return
+		}
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Disposition", `attachment; filename="beacon-reports.shp.zip"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
 	default:
-		writeErr(w, http.StatusBadRequest, "bad_format", "format must be geojson|csv|gpkg|kml")
+		writeErr(w, http.StatusBadRequest, "bad_format", "format must be geojson|csv|gpkg|kml|shapefile")
 	}
 }
