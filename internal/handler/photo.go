@@ -99,24 +99,29 @@ func (h *Handlers) UploadPhoto(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Read the whole (bounded) upload so metadata can be stripped before it is stored.
+	data, err := io.ReadAll(io.LimitReader(io.MultiReader(bytes.NewReader(head), file), maxPhotoBytes+1))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_upload", "could not read the uploaded image")
+		return
+	}
+	if len(data) > maxPhotoBytes {
+		writeErr(w, http.StatusRequestEntityTooLarge, "too_large", "image exceeds the size limit")
+		return
+	}
+	// Defense-in-depth: strip EXIF/XMP (GPS, device make/model, capture timestamp) +
+	// comments server-side for JPEG. The mobile client already strips EXIF, but the
+	// server must NOT trust the client's `exifStripped` flag — a non-Beacon client
+	// (the API is anonymous) could upload a GPS-tagged photo and lie about it.
+	data = stripJPEGMetadata(data)
+
 	if err := os.MkdirAll(h.d.PhotoDir, 0o755); err != nil {
 		writeErr(w, http.StatusInternalServerError, "store", "cannot create photo directory")
 		return
 	}
 	path := filepath.Join(h.d.PhotoDir, photoFileName(id))
-	out, err := os.Create(path)
-	if err != nil {
+	if err := os.WriteFile(path, data, 0o644); err != nil {
 		writeErr(w, http.StatusInternalServerError, "store", "cannot write photo")
-		return
-	}
-	defer out.Close()
-	// Write back the sniffed head, then stream the remainder.
-	if _, err := out.Write(head); err != nil {
-		writeErr(w, http.StatusInternalServerError, "store", "photo write failed")
-		return
-	}
-	if _, err := io.Copy(out, file); err != nil {
-		writeErr(w, http.StatusInternalServerError, "store", "photo write failed")
 		return
 	}
 
@@ -204,4 +209,46 @@ func (h *Handlers) GetPhoto(w http.ResponseWriter, r *http.Request) {
 func photoFileName(id string) string {
 	safe := strings.NewReplacer("/", "_", "\\", "_", "..", "_", " ", "_").Replace(id)
 	return safe + ".jpg"
+}
+
+// stripJPEGMetadata losslessly removes the privacy-sensitive metadata segments from a
+// JPEG — APP1 (EXIF + XMP: GPS coordinates, device make/model, capture timestamp) and
+// COM (free-text comments) — by walking the segment markers and copying everything
+// EXCEPT those segments. It does NOT re-encode (no quality loss, no CPU cost) and
+// preserves rendering-relevant segments (APP0/JFIF, APP2/ICC, quantization/Huffman
+// tables, the compressed scan). Non-JPEG or malformed input is returned unchanged
+// (PNG/WEBP carry far less location metadata and are passed through as-is).
+func stripJPEGMetadata(b []byte) []byte {
+	if len(b) < 4 || b[0] != 0xFF || b[1] != 0xD8 { // not a JPEG (no SOI)
+		return b
+	}
+	out := make([]byte, 0, len(b))
+	out = append(out, 0xFF, 0xD8) // SOI
+	i := 2
+	for i+1 < len(b) {
+		if b[i] != 0xFF { // lost marker alignment — copy the remainder verbatim, defensively
+			return append(out, b[i:]...)
+		}
+		marker := b[i+1]
+		// SOS begins the entropy-coded scan; everything from here to EOI is copied as-is.
+		// EOI ends the image. Neither has a length we should parse.
+		if marker == 0xDA || marker == 0xD9 {
+			return append(out, b[i:]...)
+		}
+		// Length-bearing segment: 2-byte big-endian length follows the marker (incl. itself).
+		if i+3 >= len(b) {
+			return append(out, b[i:]...)
+		}
+		segLen := int(b[i+2])<<8 | int(b[i+3])
+		if segLen < 2 || i+2+segLen > len(b) {
+			return append(out, b[i:]...) // malformed length — bail out, copy remainder
+		}
+		// Drop ONLY the metadata carriers: APP1 (EXIF/XMP) and COM (comment). Keep all
+		// other APPn (e.g. APP0 JFIF, APP2 ICC color) so the image still renders correctly.
+		if marker != 0xE1 && marker != 0xFE {
+			out = append(out, b[i:i+2+segLen]...)
+		}
+		i += 2 + segLen
+	}
+	return out
 }
