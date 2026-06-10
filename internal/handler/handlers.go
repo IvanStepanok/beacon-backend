@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/stepanok/beacon-server/internal/feeds"
 	"github.com/stepanok/beacon-server/internal/model"
 	"github.com/stepanok/beacon-server/internal/service"
 	"github.com/stepanok/beacon-server/internal/store"
@@ -23,7 +22,6 @@ type Deps struct {
 	Settings  *store.Settings
 	ReportSvc *service.ReportService
 	StatsSvc  *service.StatsService
-	Ingester  *feeds.Ingester // external disaster-feed ingester (nil if feeds disabled)
 	JWTSecret string
 	PhotoDir  string
 }

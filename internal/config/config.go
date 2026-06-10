@@ -11,46 +11,42 @@ import (
 )
 
 type Config struct {
-	DatabaseURL  string
-	HTTPAddr     string
-	PgxMaxConns  int32
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
-	CORSOrigins  []string
-	RateLimitRPS int
-	RunSeed      bool
-	SeedDataset  string // dashboard | mobile | both
-	JWTSecret    string // HS256 signing secret for analyst JWTs
-	PhotoDir     string // directory where uploaded report photos are stored (mounted volume in prod)
-	LogLevel     string
-	Env          string // dev | prod (controls slog handler)
-	FeedsEnabled bool   // poll external disaster feeds (USGS/GDACS) for crises
-	FeedsIntervalMin int // minutes between feed ingest passes
-	BoundariesEnabled bool // load admin boundaries (Natural Earth baseline + lazy geoBoundaries ADM1) for Area tagging
-	TranslateURL    string // self-hosted LibreTranslate base URL ("" = disabled)
-	TranslateTarget string // target language for description translation
+	DatabaseURL       string
+	HTTPAddr          string
+	PgxMaxConns       int32
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	CORSOrigins       []string
+	RateLimitRPS      int
+	RunSeed           bool
+	SeedDataset       string // dashboard | mobile | both
+	JWTSecret         string // HS256 signing secret for analyst JWTs
+	PhotoDir          string // directory where uploaded report photos are stored (mounted volume in prod)
+	LogLevel          string
+	Env               string // dev | prod (controls slog handler)
+	BoundariesEnabled bool   // load admin boundaries (Natural Earth baseline + lazy geoBoundaries ADM1) for Area tagging
+	TranslateURL      string // self-hosted LibreTranslate base URL ("" = disabled)
+	TranslateTarget   string // target language for description translation
 }
 
 func Load() (Config, error) {
 	c := Config{
-		DatabaseURL:  env("DATABASE_URL", "postgres://beacon:beacon@localhost:5544/beacon?sslmode=disable"),
-		HTTPAddr:     env("HTTP_ADDR", ":8080"),
-		PgxMaxConns:  int32(envInt("PGX_MAX_CONNS", 20)),
-		ReadTimeout:  time.Duration(envInt("READ_TIMEOUT_SEC", 15)) * time.Second,
-		WriteTimeout: time.Duration(envInt("WRITE_TIMEOUT_SEC", 30)) * time.Second,
-		CORSOrigins:  envList("CORS_ORIGINS", []string{"http://localhost:3000"}),
-		RateLimitRPS: envInt("RATE_LIMIT_RPS", 20),
-		RunSeed:      envBool("RUN_SEED", true),
-		SeedDataset:  env("SEED_DATASET", "dashboard"),
-		JWTSecret:    env("JWT_SECRET", "beacon-dev-secret-change-me"),
-		PhotoDir:     env("PHOTO_DIR", "./data/photos"),
-		LogLevel:     env("LOG_LEVEL", "info"),
-		Env:          env("ENV", "dev"),
-		FeedsEnabled: envBool("FEEDS_ENABLED", true),
-		FeedsIntervalMin: envInt("FEEDS_INTERVAL_MIN", 30),
+		DatabaseURL:       env("DATABASE_URL", "postgres://beacon:beacon@localhost:5544/beacon?sslmode=disable"),
+		HTTPAddr:          env("HTTP_ADDR", ":8080"),
+		PgxMaxConns:       int32(envInt("PGX_MAX_CONNS", 20)),
+		ReadTimeout:       time.Duration(envInt("READ_TIMEOUT_SEC", 15)) * time.Second,
+		WriteTimeout:      time.Duration(envInt("WRITE_TIMEOUT_SEC", 30)) * time.Second,
+		CORSOrigins:       envList("CORS_ORIGINS", []string{"http://localhost:3000"}),
+		RateLimitRPS:      envInt("RATE_LIMIT_RPS", 20),
+		RunSeed:           envBool("RUN_SEED", true),
+		SeedDataset:       env("SEED_DATASET", "dashboard"),
+		JWTSecret:         env("JWT_SECRET", "beacon-dev-secret-change-me"),
+		PhotoDir:          env("PHOTO_DIR", "./data/photos"),
+		LogLevel:          env("LOG_LEVEL", "info"),
+		Env:               env("ENV", "dev"),
 		BoundariesEnabled: envBool("BOUNDARIES_ENABLED", true),
-		TranslateURL:    env("TRANSLATE_URL", ""),
-		TranslateTarget: env("TRANSLATE_TARGET", "en"),
+		TranslateURL:      env("TRANSLATE_URL", ""),
+		TranslateTarget:   env("TRANSLATE_TARGET", "en"),
 	}
 	if err := c.Validate(); err != nil {
 		return Config{}, err

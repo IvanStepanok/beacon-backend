@@ -48,17 +48,6 @@ func (h *Handlers) NearbyCrises(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "count": len(items)})
 }
 
-// POST /api/v1/feeds/refresh — analyst-triggered pull of external disaster feeds
-// (USGS/GDACS) on demand (the ingester also runs on a timer). Returns a summary.
-func (h *Handlers) RefreshFeeds(w http.ResponseWriter, r *http.Request) {
-	if h.d.Ingester == nil {
-		writeErr(w, http.StatusServiceUnavailable, "feeds_disabled", "feed ingestion is disabled")
-		return
-	}
-	sum := h.d.Ingester.RunOnce(r.Context())
-	writeJSON(w, http.StatusOK, sum)
-}
-
 // PATCH /api/v1/crises/{id}/status  body: {"status":"active"|"dismissed"|"closed"}
 // Analyst confirms (active) or rejects (dismissed) an emergent proposal.
 //

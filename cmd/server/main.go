@@ -17,7 +17,6 @@ import (
 	"github.com/stepanok/beacon-server/internal/boundary"
 	"github.com/stepanok/beacon-server/internal/config"
 	"github.com/stepanok/beacon-server/internal/db"
-	"github.com/stepanok/beacon-server/internal/feeds"
 	"github.com/stepanok/beacon-server/internal/handler"
 	"github.com/stepanok/beacon-server/internal/seed"
 	"github.com/stepanok/beacon-server/internal/service"
@@ -73,12 +72,6 @@ func run() error {
 	reportSvc := service.NewReportService(pool, reports, admin, crises, translator, boundaries)
 	statsSvc := service.NewStatsService(reports)
 
-	// external disaster-feed ingester (USGS/GDACS) — nil if disabled.
-	var ingester *feeds.Ingester
-	if cfg.FeedsEnabled {
-		ingester = feeds.Default(crises, logger)
-	}
-
 	// 4. seed (idempotent — reports gated by empty table, users by empty table;
 	// PhotoDir receives the embedded demo evidence photos)
 	if cfg.RunSeed {
@@ -103,7 +96,6 @@ func run() error {
 		ReportSvc: reportSvc,
 		StatsSvc:  statsSvc,
 		Settings:  settings,
-		Ingester:  ingester,
 		JWTSecret: cfg.JWTSecret,
 		PhotoDir:  cfg.PhotoDir,
 	})
@@ -120,12 +112,6 @@ func run() error {
 	// 6. run + graceful shutdown
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	// Start the disaster-feed poller bound to the server lifetime.
-	if ingester != nil {
-		ingester.Start(shutdownCtx, time.Duration(cfg.FeedsIntervalMin)*time.Minute)
-		logger.Info("disaster-feed ingester started", "intervalMin", cfg.FeedsIntervalMin)
-	}
 
 	// Back-fill Areas for any existing reports whose country has no ADM1 loaded yet
 	// (e.g. reports submitted before this feature). Background, best-effort.

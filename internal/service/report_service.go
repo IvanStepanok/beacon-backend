@@ -462,9 +462,9 @@ func (s *ReportService) Submit(ctx context.Context, req model.SubmitReportReques
 		if r.CrisisID == "" && s.crises != nil {
 			if cid, err := s.crises.AssignCrisis(ctx, lat, lng, r.CapturedAt); err == nil {
 				r.CrisisID = cid
-				// Ground-truth activation: feed-detected (USGS/GDACS) and emergent
-				// crises are born 'proposed' — the first community report assigned to
-				// one is the on-the-ground confirmation that promotes it to 'active'.
+				// Ground-truth activation: community-EMERGENT crises are born
+				// 'proposed' — the first community report assigned to one is the
+				// on-the-ground confirmation that promotes it to 'active'.
 				if cid != "" {
 					_, _ = s.crises.ActivateIfProposed(ctx, cid)
 				}

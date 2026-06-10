@@ -196,10 +196,10 @@ func (s *Crises) DetectEmergentCrisis(ctx context.Context, lat, lng float64, at 
 }
 
 // ActivateIfProposed flips a 'proposed' crisis to 'active' — the ground-truth
-// activation step: feed-detected (USGS/GDACS) and emergent crises are born
-// 'proposed' and become 'active' only when a community report is assigned to
-// them (or an analyst activates them via SetCrisisStatus). Reports true when
-// the promotion happened, false when the crisis was already active/closed.
+// activation step: community-EMERGENT crises are born 'proposed' and become
+// 'active' only when a community report is assigned to them (or an analyst
+// activates them via SetCrisisStatus). Reports true when the promotion
+// happened, false when the crisis was already active/closed.
 func (s *Crises) ActivateIfProposed(ctx context.Context, id string) (bool, error) {
 	tag, err := s.pool.Exec(ctx,
 		"UPDATE crises SET status = 'active' WHERE id = $1 AND status = 'proposed'", id)
@@ -339,58 +339,6 @@ func (s *Crises) UpsertCrisis(ctx context.Context, c model.Crisis) error {
 		c.ID, c.Title, c.Area, c.Nature, c.CenterLat, c.CenterLng, c.Source, c.StartedAt, c.Glide, c.ResponseLevel,
 		c.RadiusKm, c.Status, c.ResponseID)
 	return err
-}
-
-// UpsertExternalCrisis inserts or refreshes a feed-sourced crisis (USGS/GDACS),
-// idempotent by its deterministic id so re-polling updates rather than duplicates.
-// On conflict it ONLY updates rows that are themselves feed-sourced — it never
-// clobbers an analyst-declared or emergent crisis.
-func (s *Crises) UpsertExternalCrisis(ctx context.Context, c model.Crisis) error {
-	if c.Status == "" {
-		c.Status = "active"
-	}
-	if c.RadiusKm == 0 {
-		c.RadiusKm = 40
-	}
-	if c.StartedAt.IsZero() {
-		c.StartedAt = time.Now().UTC()
-	}
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO crises (id, title, area, nature, geom, center_lat, center_lng, source, started_at, ended_at, glide, radius_km, status)
-		VALUES ($1,$2,$3,$4, ST_SetSRID(ST_MakePoint($6,$5),4326), $5,$6,$7,$8,$9,$10,$11,$12)
-		ON CONFLICT (id) DO UPDATE SET
-		    title = EXCLUDED.title, area = EXCLUDED.area, nature = EXCLUDED.nature,
-		    geom = EXCLUDED.geom, center_lat = EXCLUDED.center_lat, center_lng = EXCLUDED.center_lng,
-		    ended_at = EXCLUDED.ended_at, glide = EXCLUDED.glide, radius_km = EXCLUDED.radius_km,
-		    status = EXCLUDED.status
-		  WHERE crises.source LIKE 'feed:%'`,
-		c.ID, c.Title, c.Area, c.Nature, c.CenterLat, c.CenterLng, c.Source, c.StartedAt, c.EndedAt, c.Glide, c.RadiusKm, c.Status)
-	return err
-}
-
-// AssignPendingToCrisis pulls PENDING reports (crisis_id NULL) that fall within a
-// crisis's coverage radius + (generous) time window into it, and refreshes the
-// crisis's denormalized report_count. Returns how many reports were assigned.
-func (s *Crises) AssignPendingToCrisis(ctx context.Context, crisisID string) (int, error) {
-	var assigned int
-	err := RunInTx(ctx, s.pool, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			WITH c AS (SELECT geom, radius_km, started_at, ended_at FROM crises WHERE id = $1)
-			UPDATE reports r SET crisis_id = $1, updated_at = now()
-			FROM c
-			WHERE r.crisis_id IS NULL
-			  AND ST_DWithin(r.geom::geography, c.geom::geography, c.radius_km*1000.0)
-			  AND r.captured_at >= c.started_at - interval '7 days'
-			  AND (c.ended_at IS NULL OR r.captured_at <= c.ended_at + interval '7 days')`, crisisID)
-		if err != nil {
-			return err
-		}
-		assigned = int(tag.RowsAffected())
-		_, err = tx.Exec(ctx,
-			"UPDATE crises SET report_count = (SELECT count(*) FROM reports WHERE crisis_id = $1) WHERE id = $1", crisisID)
-		return err
-	})
-	return assigned, err
 }
 
 func (s *Crises) UpsertSubmitter(ctx context.Context, anonymousID string, alias *string, reportCount, buildingCount, points int, badges json.RawMessage) error {

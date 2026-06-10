@@ -43,9 +43,8 @@ info:
     photos, verification, tasking, exports, stats, crises, building timeline,
     auth). Supporting routes — `/map/features`, `/tiles/reports/{z}/{x}/{y}`,
     `/reports/area-groups`, `/reports/latest-per-building`, `/config`,
-    `/crises/{id}/danger-zones`, `/crises/{id}/status`, `/feeds/refresh`,
-    `/profile` — exist in `internal/api/router.go` but are not yet documented
-    here. `POST /v1/profile/points` is intentionally undocumented as an API:
+    `/crises/{id}/status`, `/profile` — exist in `internal/api/router.go` but are
+    not yet documented here. `POST /v1/profile/points` is intentionally undocumented as an API:
     it is the RETIRED self-award endpoint and always answers **410 Gone**
     (points/badges are server-derived from verified reports, anti-gaming).
 servers:

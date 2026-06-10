@@ -102,9 +102,6 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, h *handler.Handlers, logge
 			r.With(requireMutator).Patch("/{id}/form", h.PatchCrisisForm)   // senior analyst adjusts the modular form
 		})
 
-		// external disaster feeds (USGS/GDACS) — analyst-triggered on-demand refresh
-		r.With(requireMutator).Post("/feeds/refresh", h.RefreshFeeds)
-
 		// profile
 		r.Get("/profile", h.GetProfile)
 		r.Post("/profile/points", h.AwardPoints)
