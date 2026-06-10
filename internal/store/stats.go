@@ -34,22 +34,6 @@ func (s *Reports) StatsCounts(ctx context.Context, crisisID string) (total int, 
 	return
 }
 
-// TaskStats returns dispatch-board counts (by task stage) + open life-safety tasks.
-func (s *Reports) TaskStats(ctx context.Context, crisisID string) (tc model.TaskCounts, lifeSafetyOpen int, err error) {
-	err = s.pool.QueryRow(ctx, `
-		SELECT
-		  count(*) FILTER (WHERE task_status='new'),
-		  count(*) FILTER (WHERE task_status='triaged'),
-		  count(*) FILTER (WHERE task_status='assigned'),
-		  count(*) FILTER (WHERE task_status='in_progress'),
-		  count(*) FILTER (WHERE task_status='resolved'),
-		  count(*) FILTER (WHERE task_status='closed'),
-		  count(*) FILTER (WHERE life_safety AND task_status NOT IN ('resolved','closed'))
-		FROM reports WHERE crisis_id = $1`, crisisID).
-		Scan(&tc.New, &tc.Triaged, &tc.Assigned, &tc.InProgress, &tc.Resolved, &tc.Closed, &lifeSafetyOpen)
-	return
-}
-
 // TimeSeries returns activity buckets (index N-1 oldest .. 0 = now), mirroring the
 // dashboard's bucketing: idx = min(N-1, floor(ageMin/width)). The width adapts to
 // the crisis age so the chart stays meaningful long after onset: up to 48h it keeps

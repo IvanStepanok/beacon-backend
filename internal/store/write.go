@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -30,7 +28,7 @@ INSERT INTO reports (
   desc_original, desc_original_lang, desc_translated, desc_translated_lang,
   ai_level, ai_confidence, photos, size_bytes, modular, anonymization,
   is_mine, synced, sync_state, captured_at, created_at, updated_at, admin,
-  task_status, disposition, assignee, task_ref, severity, life_safety, clusters,
+  clusters,
   location_resolved
 ) VALUES (
   $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
@@ -42,8 +40,8 @@ INSERT INTO reports (
   $23,$24,$25,$26,
   $27,$28,$29,$30,$31,$32,
   $33,$34,$35,$36,$37,$38,$39,
-  $40,$41,$42,$43,$44,$45,$46,
-  $47
+  $40,
+  $41
 ) ON CONFLICT (id) DO NOTHING`
 
 // UpsertReport inserts a fully-formed report idempotently (ON CONFLICT (id) DO
@@ -91,13 +89,6 @@ func UpsertReport(ctx context.Context, q querier, r model.Report) (inserted bool
 	if r.UpdatedAt.IsZero() {
 		r.UpdatedAt = now
 	}
-	// CHECK-safe defaults for the tasking axis.
-	if r.TaskStatus == "" {
-		r.TaskStatus = "new"
-	}
-	if r.Severity == "" {
-		r.Severity = "routine"
-	}
 	if r.Clusters == nil {
 		r.Clusters = []string{}
 	}
@@ -112,7 +103,7 @@ func UpsertReport(ctx context.Context, q querier, r model.Report) (inserted bool
 		descO, descOL, descT, descTL,
 		r.AILevel, r.AIConfidence, photos, r.SizeBytes, modular, anon,
 		r.IsMine, r.Synced, sync, r.CapturedAt, r.CreatedAt, r.UpdatedAt, admin,
-		r.TaskStatus, r.Disposition, r.Assignee, r.TaskRef, r.Severity, r.LifeSafety, r.Clusters,
+		r.Clusters,
 		r.LocationResolved,
 	)
 	if err != nil {
@@ -207,90 +198,6 @@ func (s *Reports) UpdateVerification(ctx context.Context, id, status, actor stri
 			"UPDATE reports SET verification = $2, updated_at = now() WHERE id = $1", id, status); err != nil {
 			return err
 		}
-		row := tx.QueryRow(ctx, "SELECT "+reportSelect+" FROM reports WHERE id = $1", id)
-		r, err := scanReport(row)
-		if err != nil {
-			return err
-		}
-		updated = &r
-		return nil
-	})
-	return updated, err
-}
-
-// UpdateTask applies a partial dispatch update (status/assignee/severity/
-// disposition/clusters) in one tx, writing a per-field audit row for each change.
-// Returns nil if the report doesn't exist.
-func (s *Reports) UpdateTask(ctx context.Context, id string, req model.TaskRequest, actor string) (*model.Report, error) {
-	var updated *model.Report
-	err := RunInTx(ctx, s.pool, func(tx pgx.Tx) error {
-		var curStatus, curSeverity string
-		var curAssignee, curDisp *string
-		var curClusters []string
-		err := tx.QueryRow(ctx,
-			"SELECT task_status, assignee, severity, disposition, clusters FROM reports WHERE id = $1 FOR UPDATE", id).
-			Scan(&curStatus, &curAssignee, &curSeverity, &curDisp, &curClusters)
-		if err != nil {
-			if err == pgx.ErrNoRows {
-				return nil
-			}
-			return err
-		}
-
-		sets := []string{}
-		args := []any{}
-		audits := [][3]string{} // {field, from, to}
-		add := func(col string, val any) {
-			args = append(args, val)
-			sets = append(sets, fmt.Sprintf("%s = $%d", col, len(args)))
-		}
-		deref := func(p *string) string {
-			if p == nil {
-				return ""
-			}
-			return *p
-		}
-		if req.TaskStatus != nil && *req.TaskStatus != curStatus {
-			add("task_status", *req.TaskStatus)
-			audits = append(audits, [3]string{"task_status", curStatus, *req.TaskStatus})
-		}
-		if req.Assignee != nil && *req.Assignee != deref(curAssignee) {
-			add("assignee", *req.Assignee)
-			audits = append(audits, [3]string{"assignee", deref(curAssignee), *req.Assignee})
-		}
-		if req.Severity != nil && *req.Severity != curSeverity {
-			add("severity", *req.Severity)
-			audits = append(audits, [3]string{"severity", curSeverity, *req.Severity})
-		}
-		if req.Disposition != nil && *req.Disposition != deref(curDisp) {
-			add("disposition", *req.Disposition)
-			audits = append(audits, [3]string{"disposition", deref(curDisp), *req.Disposition})
-		}
-		if req.Clusters != nil {
-			add("clusters", *req.Clusters)
-			audits = append(audits, [3]string{"clusters", strings.Join(curClusters, ";"), strings.Join(*req.Clusters, ";")})
-		}
-
-		if len(sets) > 0 {
-			args = append(args, id)
-			sql := fmt.Sprintf("UPDATE reports SET %s, updated_at = now() WHERE id = $%d",
-				strings.Join(sets, ", "), len(args))
-			if _, err := tx.Exec(ctx, sql, args...); err != nil {
-				return err
-			}
-			note := ""
-			if req.Note != nil {
-				note = *req.Note
-			}
-			for _, a := range audits {
-				if _, err := tx.Exec(ctx,
-					"INSERT INTO report_task_audit (report_id, field, from_value, to_value, actor, note) VALUES ($1,$2,$3,$4,$5,$6)",
-					id, a[0], a[1], a[2], actor, note); err != nil {
-					return err
-				}
-			}
-		}
-
 		row := tx.QueryRow(ctx, "SELECT "+reportSelect+" FROM reports WHERE id = $1", id)
 		r, err := scanReport(row)
 		if err != nil {

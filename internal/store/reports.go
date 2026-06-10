@@ -26,7 +26,7 @@ const reportSelect = `
   desc_original, desc_original_lang, desc_translated, desc_translated_lang,
   ai_level, ai_confidence, photos, size_bytes, modular, anonymization,
   is_mine, synced, sync_state, captured_at, created_at, updated_at, admin,
-  task_status, disposition, assignee, task_ref, severity, life_safety, clusters,
+  clusters,
   GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (now() - captured_at)) / 60))::int AS age_min,
   damage_tier, location_resolved`
 
@@ -40,7 +40,6 @@ func scanReport(row pgx.Row) (model.Report, error) {
 		descTranslated, descTranslatedLang      *string
 		photosRaw, modularRaw, anonRaw, syncRaw []byte
 		adminRaw                                []byte
-		disposition, assignee, taskRef          *string
 		lat, lng                                *float64 // nullable: NULL for location-unresolved reports
 	)
 	err := row.Scan(
@@ -50,14 +49,13 @@ func scanReport(row pgx.Row) (model.Report, error) {
 		&descOriginal, &descOriginalLang, &descTranslated, &descTranslatedLang,
 		&r.AILevel, &r.AIConfidence, &photosRaw, &r.SizeBytes, &modularRaw, &anonRaw,
 		&r.IsMine, &r.Synced, &syncRaw, &r.CapturedAt, &r.CreatedAt, &r.UpdatedAt, &adminRaw,
-		&r.TaskStatus, &disposition, &assignee, &taskRef, &r.Severity, &r.LifeSafety, &r.Clusters, &r.AgeMin,
+		&r.Clusters, &r.AgeMin,
 		&r.DamageTier, &r.LocationResolved,
 	)
 	if err != nil {
 		return model.Report{}, err
 	}
 	r.Lat, r.Lng = lat, lng
-	r.Disposition, r.Assignee, r.TaskRef = disposition, assignee, taskRef
 	if r.Clusters == nil {
 		r.Clusters = []string{}
 	}
@@ -149,7 +147,7 @@ func scanReports(rows pgx.Rows) ([]model.Report, error) {
 // ── filtering & pagination ─────────────────────────────────────────────
 
 type ListFilter struct {
-	CrisisID     string
+	CrisisID string
 	// CrisisIDs scopes the LIST to multiple crises (a regional analyst's finite scope).
 	// Used ONLY when CrisisID == "". Empty/nil CrisisIDs with an empty CrisisID means NO
 	// crisis filter at all (org-wide '*' => every crisis). Export keeps using CrisisID only.
@@ -163,10 +161,6 @@ type ListFilter struct {
 	Adm1Pcode    *string
 	Adm2Pcode    *string
 	Adm3Pcode    *string
-	TaskStatus   []string
-	Severity     []string
-	LifeSafety   bool
-	Assignee     *string
 	Cluster      *string
 	BBox         *[4]float64 // minLng,minLat,maxLng,maxLat
 	Limit        int
@@ -244,18 +238,6 @@ func (f ListFilter) whereClause(startArg int) (string, []any) {
 	}
 	if f.Adm3Pcode != nil {
 		add("adm3_pcode = $%d", *f.Adm3Pcode)
-	}
-	if len(f.TaskStatus) > 0 {
-		add("task_status = ANY($%d)", f.TaskStatus)
-	}
-	if len(f.Severity) > 0 {
-		add("severity = ANY($%d)", f.Severity)
-	}
-	if f.LifeSafety {
-		conds = append(conds, "life_safety")
-	}
-	if f.Assignee != nil {
-		add("assignee = $%d", *f.Assignee)
 	}
 	if f.Cluster != nil {
 		add("$%d = ANY(clusters)", *f.Cluster)

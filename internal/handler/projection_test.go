@@ -36,9 +36,7 @@ func fullReport() model.Report {
 		AILevel:     sptr("severe"), AIConfidence: &conf,
 		Modular:       json.RawMessage(`{"electricity":"severe"}`),
 		Anonymization: model.DefaultAnonymization(),
-		TaskStatus:    "in_progress", Disposition: sptr("referred"), Assignee: sptr("Alpha Team"),
-		TaskRef: sptr("ANT-1156"), Severity: "life_safety", LifeSafety: true,
-		Clusters: []string{"slsc"},
+		Clusters:      []string{"slsc"},
 	}
 }
 
@@ -81,11 +79,8 @@ func TestPublicProjection_Coarsening(t *testing.T) {
 	if pub.Description != nil {
 		t.Errorf("description leaked: %+v", pub.Description)
 	}
-	if pub.Assignee != nil || pub.TaskRef != nil || pub.Disposition != nil {
-		t.Errorf("dispatch fields leaked: %v %v %v", pub.Assignee, pub.TaskRef, pub.Disposition)
-	}
-	if pub.TaskStatus != "" || pub.Severity != "" || pub.LifeSafety || len(pub.Clusters) != 0 {
-		t.Errorf("task axis leaked: %q %q %v %v", pub.TaskStatus, pub.Severity, pub.LifeSafety, pub.Clusters)
+	if len(pub.Clusters) != 0 {
+		t.Errorf("clusters leaked into public projection: %v", pub.Clusters)
 	}
 	if pub.AILevel != nil || pub.AIConfidence != nil || pub.Modular != nil {
 		t.Errorf("AI/modular leaked: %v %v %s", pub.AILevel, pub.AIConfidence, pub.Modular)

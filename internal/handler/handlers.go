@@ -79,9 +79,8 @@ func coarsen(x float64) float64 {
 //     would de-coarsen the ~110m grid or de-anonymize the reporter (flat fields AND
 //     the nested location);
 //   - operational / PII / analyst-only fields: description (free-text + reporter
-//     language, can carry PII), assignee, taskStatus, taskRef, disposition, severity,
-//     lifeSafety, clusters, the raw AI level/confidence, the modular blob, and the
-//     anonymization object (which is operational metadata, not public-facing).
+//     language, can carry PII), clusters, the raw AI level/confidence, the modular
+//     blob, and the anonymization object (operational metadata, not public-facing).
 //
 // Authenticated analyst roles never go through this projection and keep full precision.
 func publicProjection(rep model.Report) model.Report {
@@ -116,12 +115,6 @@ func publicProjection(rep model.Report) model.Report {
 	// de-coarsen the grid, so it is stripped like description/landmark.
 	rep.InfraName = nil
 	rep.Description = nil
-	rep.Assignee = nil
-	rep.TaskStatus = ""
-	rep.TaskRef = nil
-	rep.Disposition = nil
-	rep.Severity = ""
-	rep.LifeSafety = false
 	rep.Clusters = []string{}
 	rep.AILevel = nil
 	rep.AIConfidence = nil

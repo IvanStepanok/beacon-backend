@@ -141,11 +141,6 @@ var clusterFor = map[string]string{
 	"utility": "wash", "transport": "logistics", "community": "cccm", "public": "education",
 }
 
-var (
-	teams            = []string{"Alpha Team", "Bravo Team", "SAR Unit 1", "WASH Crew", "Shelter Team"}
-	seedDispositions = []string{"resolved", "cleared_nothing_found", "no_action_needed", "gone_on_arrival", "referred"}
-)
-
 // modularSeed mirrors the [C1] modular wire/stored shape (camelCase keys) so the
 // seeded blob is byte-compatible with what the mobile client POSTs.
 type modularSeed struct {
@@ -278,46 +273,9 @@ func BuildReports(base time.Time) []model.Report {
 			r.AIConfidence = &conf
 		}
 
-		// dispatch state — a realistic command board, not all "new".
-		ref := "ANT-" + id
-		r.TaskRef = &ref
+		// affected-sector tags (OCHA humanitarian clusters) — an optional data dimension.
 		if c, ok := clusterFor[r.InfraTypes[0]]; ok {
 			r.Clusters = []string{c}
-		}
-		lifeSafety := (dmg == "destroyed" || dmg == "severe") && rnd(fi+950) > 0.55
-		r.LifeSafety = lifeSafety
-		switch {
-		case lifeSafety:
-			r.Severity = "life_safety"
-		case dmg == "destroyed":
-			r.Severity = "elevated"
-		default:
-			r.Severity = "routine"
-		}
-		if r.Verification == "verified" {
-			switch x := rnd(fi + 970); {
-			case x < 0.25:
-				r.TaskStatus = "closed"
-				r.Disposition = strptr(pick(seedDispositions, fi+980))
-				t := pick(teams, fi+990)
-				r.Assignee = &t
-			case x < 0.5:
-				r.TaskStatus = "resolved"
-				t := pick(teams, fi+990)
-				r.Assignee = &t
-			case x < 0.78:
-				r.TaskStatus = "in_progress"
-				t := pick(teams, fi+990)
-				r.Assignee = &t
-			default:
-				r.TaskStatus = "assigned"
-				t := pick(teams, fi+990)
-				r.Assignee = &t
-			}
-		} else if rnd(fi+970) < 0.5 {
-			r.TaskStatus = "triaged"
-		} else {
-			r.TaskStatus = "new"
 		}
 		out = append(out, r)
 	}

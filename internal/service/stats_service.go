@@ -41,10 +41,6 @@ func (s *StatsService) Overview(ctx context.Context, crisisID string) (*model.St
 	if err != nil {
 		return nil, err
 	}
-	tc, lifeSafetyOpen, err := s.reports.TaskStats(ctx, crisisID)
-	if err != nil {
-		return nil, err
-	}
 	// Headline damage percentages are computed off the CANONICAL tier rollup so they
 	// stay correct under either capture scale (the global default is tier3, whose
 	// reports never appear in the 5-level dmg.* counts). complete == EMS-98 destroyed
@@ -60,8 +56,6 @@ func (s *StatsService) Overview(ctx context.Context, crisisID string) (*model.St
 		CompletePct:        completePct,
 		DestroyedPct:       completePct, // alias kept for dashboard compatibility
 		SeverePlusPct:      pct(tier.Partial+tier.Complete, total),
-		TaskCounts:         tc,
-		LifeSafetyOpen:     lifeSafetyOpen,
 		Areas:              areas,
 		TimeSeries:         series,
 		TimeSeriesUnit:     seriesUnit,

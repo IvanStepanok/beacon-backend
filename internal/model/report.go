@@ -167,14 +167,8 @@ type Report struct {
 	Modular       json.RawMessage `json:"modular,omitempty"`
 	Anonymization Anonymization   `json:"anonymization"`
 
-	// Tasking axis (orthogonal to verification) + severity + cluster routing.
-	TaskStatus  string   `json:"taskStatus"`
-	Disposition *string  `json:"disposition,omitempty"`
-	Assignee    *string  `json:"assignee,omitempty"`
-	TaskRef     *string  `json:"taskRef,omitempty"`
-	Severity    string   `json:"severity"`
-	LifeSafety  bool     `json:"lifeSafety"`
-	Clusters    []string `json:"clusters"`
+	// Affected-sector tags (OCHA humanitarian clusters) — an optional data dimension.
+	Clusters []string `json:"clusters"`
 
 	IsMine bool            `json:"isMine"`
 	Synced bool            `json:"synced"`
@@ -230,27 +224,11 @@ type SubmitReportRequest struct {
 	Anonymization *Anonymization     `json:"anonymization"`
 	Sync          json.RawMessage    `json:"sync"`
 	CapturedAt    *time.Time         `json:"capturedAt"`
-	LifeSafety    bool               `json:"lifeSafety"` // intake life-safety question (people at risk)
-	Clusters      []string           `json:"clusters"`   // reporter-suggested sector(s)
+	Clusters      []string           `json:"clusters"` // reporter-suggested affected sector(s)
 }
 
-// Enum sets for the tasking axis.
-var (
-	TaskStatuses = []string{"new", "triaged", "assigned", "in_progress", "resolved", "closed"}
-	Severities   = []string{"routine", "elevated", "life_safety"}
-	Dispositions = []string{"resolved", "cleared_nothing_found", "no_action_needed", "gone_on_arrival", "unfounded", "duplicate", "referred"}
-	Clusters     = []string{"slsc", "health", "wash", "education", "food_security", "protection", "logistics", "nutrition", "etc", "cccm", "early_recovery"}
-)
-
-// TaskRequest is the analyst dispatch PATCH: any subset advances the task.
-type TaskRequest struct {
-	TaskStatus  *string   `json:"taskStatus"`
-	Assignee    *string   `json:"assignee"`
-	Severity    *string   `json:"severity"`
-	Disposition *string   `json:"disposition"`
-	Clusters    *[]string `json:"clusters"`
-	Note        *string   `json:"note"`
-}
+// Clusters is the closed set of OCHA humanitarian sectors a report may be tagged with.
+var Clusters = []string{"slsc", "health", "wash", "education", "food_security", "protection", "logistics", "nutrition", "etc", "cccm", "early_recovery"}
 
 // VerificationRequest is the analyst PATCH body. `status` is the canonical key;
 // `verification` is the legacy alias older dashboards still send (status wins when

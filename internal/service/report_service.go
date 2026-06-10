@@ -228,24 +228,13 @@ func normalize(req model.SubmitReportRequest, submitterID *string) (model.Report
 	}
 	r.Version = 1
 
-	// Tasking axis: a new report enters the dispatch queue. Life-safety at intake
-	// puts it on the fast lane (severity life_safety); analysts can elevate later.
-	r.TaskStatus = "new"
-	r.LifeSafety = req.LifeSafety
-	if req.LifeSafety {
-		r.Severity = "life_safety"
-	} else {
-		r.Severity = "routine"
-	}
+	// Affected-sector tags (OCHA humanitarian clusters): an optional reporter-set
+	// data dimension on the report. No dispatch/tasking axis — Beacon produces a
+	// structured situational-awareness dataset, not a responder dispatch system (Q23).
 	r.Clusters = req.Clusters
 	if r.Clusters == nil {
 		r.Clusters = []string{}
 	}
-	ref := "ANT-" + r.ID
-	if len(r.ID) > 8 {
-		ref = "ANT-" + r.ID[:8]
-	}
-	r.TaskRef = &ref
 	return r, nil
 }
 

@@ -70,7 +70,6 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, h *handler.Handlers, logge
 			r.Post("/{id}/photo", h.UploadPhoto)                   // mobile: anonymous photo upload
 			r.Get("/{id}/photo", h.GetPhoto)                       // public: serve report photo
 			r.With(requireMutator).Patch("/{id}/verification", h.PatchVerification)
-			r.With(requireMutator).Patch("/{id}/task", h.PatchTask)
 		})
 
 		// buildings

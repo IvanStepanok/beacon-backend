@@ -23,8 +23,8 @@ type Crisis struct {
 	ResponseLevel *int      `json:"responseLevel,omitempty"` // UNDP corporate crisis Level 1/2/3
 
 	// Spatial + temporal extent and lifecycle (a crisis is a discrete EVENT).
-	RadiusKm    float64    `json:"radiusKm"`              // coverage radius around the center point (km)
-	EndedAt     *time.Time `json:"endedAt,omitempty"`     // nil = still ongoing
+	RadiusKm    float64    `json:"radiusKm"`             // coverage radius around the center point (km)
+	EndedAt     *time.Time `json:"endedAt,omitempty"`    // nil = still ongoing
 	Status      string     `json:"status"`               // active | proposed (emergent, awaiting analyst) | closed | dismissed
 	ResponseID  *string    `json:"responseId,omitempty"` // optional umbrella response
 	ReportCount int        `json:"reportCount"`          // denormalized cluster size
@@ -122,17 +122,6 @@ type TimeBucket struct {
 	Count int `json:"count"`
 }
 
-// TaskCounts powers the dispatch board (open work by stage).
-// Keyed by the task_status wire values so clients can index by TaskStatus.
-type TaskCounts struct {
-	New        int `json:"new"`
-	Triaged    int `json:"triaged"`
-	Assigned   int `json:"assigned"`
-	InProgress int `json:"in_progress"`
-	Resolved   int `json:"resolved"`
-	Closed     int `json:"closed"`
-}
-
 type StatsOverview struct {
 	TotalReports int `json:"totalReports"`
 	// DamageTierCounts is the canonical breakdown (sums to TotalReports). DamageCounts
@@ -150,8 +139,6 @@ type StatsOverview struct {
 	DestroyedPct  int `json:"destroyedPct"` // alias of completePct (kept for dashboard compatibility)
 	SeverePlusPct int `json:"severePlusPct"`
 
-	TaskCounts     TaskCounts   `json:"taskCounts"`
-	LifeSafetyOpen int          `json:"lifeSafetyOpen"` // open life-safety tasks (fast lane)
 	Areas          []AreaGroup  `json:"areas"`
 	TimeSeries     []TimeBucket `json:"timeSeries"`
 	TimeSeriesUnit string       `json:"timeSeriesUnit"` // "hour" | "day" — see store.Reports.TimeSeries
