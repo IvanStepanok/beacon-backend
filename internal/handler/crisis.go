@@ -130,16 +130,6 @@ func (h *Handlers) GetCrisis(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, c)
 }
 
-// GET /api/v1/crises/{id}/danger-zones
-func (h *Handlers) DangerZones(w http.ResponseWriter, r *http.Request) {
-	zones, err := h.d.Crises.DangerZones(r.Context(), chi.URLParam(r, "id"))
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "internal", "query failed")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": zones})
-}
-
 type mapGeometry struct {
 	Type        string     `json:"type"`
 	Coordinates [2]float64 `json:"coordinates"`

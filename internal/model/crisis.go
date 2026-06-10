@@ -34,40 +34,6 @@ type Crisis struct {
 	Covers     *bool    `json:"covers,omitempty"` // true if the queried point is within radiusKm
 }
 
-// PdnaRow is one cell of the PDNA-ready damage-count aggregate: report COUNTS by
-// damage grade for a (sector × admin area) pair — a damage-count input for a PDNA,
-// NOT a loss/cost estimation (no monetary / replacement-value figures).
-//
-// Both vocabularies are reported. The 3-tier rollup (Minimal/Partial/Complete) is
-// the CANONICAL breakdown — it is vocabulary-agnostic and Minimal+Partial+Complete
-// always == Total (every report rolls into exactly one tier). The 5-level fields
-// (None…Destroyed) are kept as detail; they only carry counts for reports captured
-// on the EMS-98 scale and DO NOT sum to Total when tier3-scale reports are present.
-type PdnaRow struct {
-	AdmPcode string `json:"admPcode"`
-	AdmName  string `json:"admName"`
-	Sector   string `json:"sector"`
-	// Canonical 3-tier rollup (sums to Total).
-	Minimal  int `json:"minimal"`
-	Partial  int `json:"partial"`
-	Complete int `json:"complete"`
-	// 5-level EMS-98 detail (only populated for ems98-scale reports).
-	None      int `json:"none"`
-	Slight    int `json:"slight"`
-	Moderate  int `json:"moderate"`
-	Severe    int `json:"severe"`
-	Destroyed int `json:"destroyed"`
-	Total     int `json:"total"`
-}
-
-type DangerZone struct {
-	ID       string `json:"id"`
-	CrisisID string `json:"crisisId"`
-	Name     string `json:"name"`
-	Note     string `json:"note"`
-	Severity string `json:"severity"`
-}
-
 type Building struct {
 	ID            string   `json:"id"`
 	CrisisID      string   `json:"crisisId"`
@@ -148,6 +114,9 @@ type VerificationCounts struct {
 	Flagged  int `json:"flagged"`
 }
 
+// TimeBucket is one activity bucket; `hour` is the bucket index in
+// StatsOverview.TimeSeriesUnit steps ago (0 = now). The json key predates the
+// adaptive daily bucketing and is kept for dashboard compatibility.
 type TimeBucket struct {
 	Hour  int `json:"hour"`
 	Count int `json:"count"`
@@ -185,6 +154,7 @@ type StatsOverview struct {
 	LifeSafetyOpen int          `json:"lifeSafetyOpen"` // open life-safety tasks (fast lane)
 	Areas          []AreaGroup  `json:"areas"`
 	TimeSeries     []TimeBucket `json:"timeSeries"`
+	TimeSeriesUnit string       `json:"timeSeriesUnit"` // "hour" | "day" — see store.Reports.TimeSeries
 	Recent         []Report     `json:"recent"`
 }
 

@@ -79,9 +79,10 @@ func run() error {
 		ingester = feeds.Default(crises, logger)
 	}
 
-	// 4. seed (idempotent — reports gated by empty table, users by empty table)
+	// 4. seed (idempotent — reports gated by empty table, users by empty table;
+	// PhotoDir receives the embedded demo evidence photos)
 	if cfg.RunSeed {
-		if err := seed.Run(ctx, pool, reports, crises, admin, users, cfg.SeedDataset, logger); err != nil {
+		if err := seed.Run(ctx, pool, reports, crises, admin, users, cfg.SeedDataset, cfg.PhotoDir, logger); err != nil {
 			return err
 		}
 	}

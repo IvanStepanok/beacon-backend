@@ -241,13 +241,17 @@ func (h *Handlers) ReportTile(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/v1/reports/area-groups
+// Public aggregate. For the public tier (anonymous OR external_viewer) the counts
+// cover VERIFIED reports only — mirroring /map/features — so the public page never
+// shows area totals that disagree with (or leak beyond) the verified-only public
+// map. Real analyst roles keep the full all-statuses counts.
 func (h *Handlers) AreaGroups(w http.ResponseWriter, r *http.Request) {
 	cid, err := h.crisisID(r)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "internal", "could not resolve crisis scope")
 		return
 	}
-	groups, err := h.d.Reports.AreaGroups(r.Context(), cid)
+	groups, err := h.d.Reports.AreaGroups(r.Context(), cid, isPublicTier(r))
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "internal", "query failed")
 		return

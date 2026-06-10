@@ -11,13 +11,17 @@ import (
 
 // TestSeedParity locks the distributions to the dashboard/mobile dataset. If the
 // ported rnd()/pick() ever drifts from JS Math.sin, this fails CI instead of
-// silently diverging the two clients' seed data.
+// silently diverging the two clients' seed data. Counts are the golden
+// assertion; timestamps are asserted only RELATIVE to the supplied base —
+// never as absolute dates — so the seed stays demo-fresh whenever it runs.
 func TestSeedParity(t *testing.T) {
-	reps := BuildReports(time.Unix(1_700_000_000, 0).UTC())
+	base := time.Unix(1_700_000_000, 0).UTC()
+	reps := BuildReports(base)
 	if len(reps) != 56 {
 		t.Fatalf("report count = %d, want 56", len(reps))
 	}
 
+	crisisStart := base.Add(-seedCrisisWindow)
 	dmg := map[string]int{}
 	ver := map[string]int{}
 	synced, possibly := 0, 0
@@ -36,6 +40,14 @@ func TestSeedParity(t *testing.T) {
 		if model.DamageOrder[r.Damage] == 0 && r.Damage != "none" {
 			t.Errorf("unknown damage grade %q", r.Damage)
 		}
+		// Relative window: every capture sits after the crisis start and before
+		// base, and reaches the server (created_at) after it was captured.
+		if !r.CapturedAt.After(crisisStart) || r.CapturedAt.After(base) {
+			t.Errorf("report %s: capturedAt %v outside (crisisStart %v, base %v]", r.ID, r.CapturedAt, crisisStart, base)
+		}
+		if r.CreatedAt.Before(r.CapturedAt) {
+			t.Errorf("report %s: createdAt %v before capturedAt %v", r.ID, r.CreatedAt, r.CapturedAt)
+		}
 	}
 	t.Logf("damage(5)=%v synced=%d possibly=%d", dmg, synced, possibly)
 
@@ -50,6 +62,59 @@ func TestSeedParity(t *testing.T) {
 	}
 	if synced != 37 {
 		t.Errorf("synced = %d, want 37", synced)
+	}
+
+	// Determinism: the same base must reproduce the exact same capture offsets
+	// (the spread is rnd-derived, not wall-clock-derived).
+	again := BuildReports(base)
+	for i := range reps {
+		if !reps[i].CapturedAt.Equal(again[i].CapturedAt) {
+			t.Errorf("report %s: capturedAt not deterministic: %v vs %v", reps[i].ID, reps[i].CapturedAt, again[i].CapturedAt)
+		}
+	}
+}
+
+// TestSeedBuildingIdentity locks the post-fabrication building mix: a seeded
+// report either came from a tapped footprint — a deterministic "fp-" id WITH
+// buildingSource="footprint", so per-building version chains stay believable —
+// or is GPS pin-only (no buildingId at all), the new normal for mobile reports.
+// The synthetic "b-<grid>" ids the mobile client removed must never reappear.
+// The footprint share is the golden ~60% draw: exactly 33 of 56.
+func TestSeedBuildingIdentity(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0).UTC()
+	footprints := 0
+	for _, r := range BuildReports(base) {
+		if r.BuildingID == nil {
+			if r.BuildingSource != nil {
+				t.Errorf("report %s: pin-only report must carry no buildingSource, got %q", r.ID, *r.BuildingSource)
+			}
+			continue
+		}
+		if !strings.HasPrefix(*r.BuildingID, "fp-") {
+			t.Errorf("report %s: buildingId %q is not footprint-style (fabricated grid ids must not reappear)", r.ID, *r.BuildingID)
+		}
+		if r.BuildingSource == nil || *r.BuildingSource != "footprint" {
+			t.Errorf("report %s: fp- id without buildingSource=footprint", r.ID)
+		}
+		footprints++
+	}
+	if footprints != 33 {
+		t.Errorf("footprint reports = %d, want 33 (~60%% of 56)", footprints)
+	}
+
+	// The demo version chain is a footprint re-report by definition: all three
+	// entries share one deterministic fp- id + the footprint provenance.
+	chain := buildVersionChain(base)
+	for _, r := range chain {
+		if r.BuildingID == nil || !strings.HasPrefix(*r.BuildingID, "fp-") ||
+			r.BuildingSource == nil || *r.BuildingSource != "footprint" {
+			t.Errorf("version-chain report %s must be a footprint re-report (fp- id + buildingSource)", r.ID)
+		}
+	}
+	for _, r := range chain[1:] {
+		if *r.BuildingID != *chain[0].BuildingID {
+			t.Errorf("version chain must share one building id: %q vs %q", *r.BuildingID, *chain[0].BuildingID)
+		}
 	}
 }
 
@@ -124,6 +189,73 @@ func TestSeedModular(t *testing.T) {
 		if string(reps[i].Modular) != string(again[i].Modular) {
 			t.Errorf("report %s: modular not deterministic:\n%s\nvs\n%s",
 				reps[i].ID, reps[i].Modular, again[i].Modular)
+		}
+	}
+}
+
+// TestSeedPhotos locks the embedded demo evidence: 8–12 real photos under a
+// 3 MB embed budget, and an assignment where EVERY verified report carries a
+// photo with its honest byte size (the photo gate must hold in the demo), while
+// photo-less reports honestly report SizeBytes 0 — never a fabricated payload.
+func TestSeedPhotos(t *testing.T) {
+	photos, err := loadSeedPhotos()
+	if err != nil {
+		t.Fatalf("loadSeedPhotos: %v", err)
+	}
+	if len(photos) < 8 || len(photos) > 12 {
+		t.Errorf("embedded photos = %d, want 8..12", len(photos))
+	}
+	sizeByName := map[string]int64{}
+	var total int64
+	for _, p := range photos {
+		if len(p.data) == 0 {
+			t.Errorf("photo %s is empty", p.name)
+		}
+		sizeByName[p.name] = int64(len(p.data))
+		total += int64(len(p.data))
+	}
+	if total >= 3<<20 {
+		t.Errorf("embedded photo total = %d bytes, must stay under 3 MB", total)
+	}
+
+	base := time.Unix(1_700_000_000, 0).UTC()
+	reps := append(BuildReports(base), buildVersionChain(base)...)
+	assignSeedPhotos(reps, photos)
+
+	for _, r := range reps {
+		if r.Verification == "verified" && r.PhotoURL == nil {
+			t.Errorf("verified report %s has no photo (the photo gate must hold in the demo)", r.ID)
+		}
+		if r.PhotoURL == nil {
+			if r.SizeBytes != 0 || len(r.Photos) != 0 {
+				t.Errorf("photo-less report %s: SizeBytes=%d photos=%d, want 0/0 (honest sizes)", r.ID, r.SizeBytes, len(r.Photos))
+			}
+			continue
+		}
+		if want := "/api/v1/reports/" + r.ID + "/photo"; *r.PhotoURL != want {
+			t.Errorf("report %s: photoUrl %q, want %q", r.ID, *r.PhotoURL, want)
+		}
+		if len(r.Photos) != 1 {
+			t.Fatalf("report %s: photos = %d, want 1", r.ID, len(r.Photos))
+		}
+		wantSize, ok := sizeByName[r.Photos[0].LocalPath]
+		if !ok {
+			t.Errorf("report %s references unknown photo %q", r.ID, r.Photos[0].LocalPath)
+		} else if r.SizeBytes != wantSize || r.Photos[0].SizeBytes != wantSize {
+			t.Errorf("report %s: SizeBytes=%d/%d, want the real embedded size %d", r.ID, r.SizeBytes, r.Photos[0].SizeBytes, wantSize)
+		}
+	}
+
+	// Determinism: the index-keyed round-robin must be byte-identical across runs.
+	again := append(BuildReports(base), buildVersionChain(base)...)
+	assignSeedPhotos(again, photos)
+	for i := range reps {
+		a, b := reps[i].PhotoURL, again[i].PhotoURL
+		switch {
+		case (a == nil) != (b == nil):
+			t.Errorf("report %s: photo assignment not deterministic", reps[i].ID)
+		case a != nil && (*a != *b || reps[i].Photos[0].LocalPath != again[i].Photos[0].LocalPath):
+			t.Errorf("report %s: photo assignment not deterministic (%s vs %s)", reps[i].ID, reps[i].Photos[0].LocalPath, again[i].Photos[0].LocalPath)
 		}
 	}
 }

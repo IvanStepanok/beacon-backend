@@ -129,21 +129,25 @@ const (
 // creates a 'proposed' crisis (source='emergent') at the cluster centroid and
 // pulls the clustered pending reports (and their buildings) into it. Returns the
 // new crisis id, or "" when no cluster formed. An analyst confirms/dismisses it.
-func (s *Crises) DetectEmergentCrisis(ctx context.Context, lat, lng float64, at time.Time) (string, error) {
+//
+// areaName resolves the centroid to an admin-area name (the service passes the
+// admin_areas reverse-geocode; "" / nil = unresolved). The title/area are NEVER
+// built from a report's free-text place — client placeholders like "Your location"
+// must not leak into crisis titles; the fallback is the centroid's coordinates.
+func (s *Crises) DetectEmergentCrisis(ctx context.Context, lat, lng float64, at time.Time, areaName func(ctx context.Context, lat, lng float64) string) (string, error) {
 	cutoff := at.Add(-emergentWindowHrs * time.Hour)
 	pt := "ST_SetSRID(ST_MakePoint($2,$1),4326)::geography"
 
 	var n int
 	var clat, clng float64
 	var earliest time.Time
-	var nature, place *string
+	var nature *string
 	err := s.pool.QueryRow(ctx, "SELECT count(*), COALESCE(avg(lat),0), COALESCE(avg(lng),0), COALESCE(min(captured_at), now()),\n"+
-		"  mode() WITHIN GROUP (ORDER BY (crisis_nature)[1]),\n"+
-		"  mode() WITHIN GROUP (ORDER BY NULLIF(place,''))\n"+
+		"  mode() WITHIN GROUP (ORDER BY (crisis_nature)[1])\n"+
 		"FROM reports\n"+
 		"WHERE crisis_id IS NULL AND captured_at >= $3\n"+
 		"  AND ST_DWithin(geom::geography, "+pt+", $4*1000.0)",
-		lat, lng, cutoff, emergentRadiusKm).Scan(&n, &clat, &clng, &earliest, &nature, &place)
+		lat, lng, cutoff, emergentRadiusKm).Scan(&n, &clat, &clng, &earliest, &nature)
 	if err != nil {
 		return "", err
 	}
@@ -155,11 +159,13 @@ func (s *Crises) DetectEmergentCrisis(ctx context.Context, lat, lng float64, at 
 	if nature != nil && *nature != "" {
 		nat = *nature
 	}
-	title := "Possible new event"
+	title := fmt.Sprintf("Possible new event near %.2f, %.2f", clat, clng)
 	area := "Reported damage cluster"
-	if place != nil && *place != "" {
-		title += " · " + *place
-		area = *place
+	if areaName != nil {
+		if name := areaName(ctx, clat, clng); name != "" {
+			title = "Possible new event · " + name
+			area = name
+		}
 	}
 
 	var newID string
@@ -234,6 +240,49 @@ func (s *Crises) SetCrisisStatus(ctx context.Context, id, status string) (*model
 	return updated, err
 }
 
+// FormOverrides loads a crisis's stored modular-form overrides. nil means
+// "defaults apply" — returned both when the crisis has no overrides (NULL
+// column) and when the crisis does not exist, so the PUBLIC /form-schema read
+// never errors out over a stale/unknown crisis id (offline-first clients may
+// hold one); the capture form falls back to the built-in sections.
+func (s *Crises) FormOverrides(ctx context.Context, crisisID string) (*model.FormOverrides, error) {
+	var raw []byte
+	err := s.pool.QueryRow(ctx, "SELECT form_overrides FROM crises WHERE id = $1", crisisID).Scan(&raw)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var ov model.FormOverrides
+	if err := json.Unmarshal(raw, &ov); err != nil {
+		return nil, err
+	}
+	return &ov, nil
+}
+
+// SetFormOverrides stores a crisis's form overrides verbatim. Empty overrides
+// (both lists empty) clear the column back to NULL — "reset to defaults".
+// Returns false when the crisis does not exist (→ 404 at the handler).
+func (s *Crises) SetFormOverrides(ctx context.Context, crisisID string, ov model.FormOverrides) (bool, error) {
+	var val any
+	if len(ov.Required) > 0 || len(ov.Disabled) > 0 {
+		b, err := json.Marshal(ov)
+		if err != nil {
+			return false, err
+		}
+		val = b
+	}
+	tag, err := s.pool.Exec(ctx, "UPDATE crises SET form_overrides = $2 WHERE id = $1", crisisID, val)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 func (s *Crises) Get(ctx context.Context, id string) (*model.Crisis, error) {
 	c, err := scanCrisis(s.pool.QueryRow(ctx, "SELECT "+crisisSelect+" FROM crises WHERE id = $1", id))
 	if err != nil {
@@ -272,24 +321,6 @@ func (s *Crises) ActiveID(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return id, nil
-}
-
-func (s *Crises) DangerZones(ctx context.Context, crisisID string) ([]model.DangerZone, error) {
-	rows, err := s.pool.Query(ctx,
-		"SELECT id, crisis_id, name, note, severity FROM danger_zones WHERE crisis_id = $1 ORDER BY id", crisisID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []model.DangerZone{}
-	for rows.Next() {
-		var d model.DangerZone
-		if err := rows.Scan(&d.ID, &d.CrisisID, &d.Name, &d.Note, &d.Severity); err != nil {
-			return nil, err
-		}
-		out = append(out, d)
-	}
-	return out, rows.Err()
 }
 
 // ── seeder upserts ──────────────────────────────────────────────────────
@@ -360,14 +391,6 @@ func (s *Crises) AssignPendingToCrisis(ctx context.Context, crisisID string) (in
 		return err
 	})
 	return assigned, err
-}
-
-func (s *Crises) UpsertDangerZone(ctx context.Context, d model.DangerZone) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO danger_zones (id, crisis_id, name, note, severity)
-		VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO NOTHING`,
-		d.ID, d.CrisisID, d.Name, d.Note, d.Severity)
-	return err
 }
 
 func (s *Crises) UpsertSubmitter(ctx context.Context, anonymousID string, alias *string, reportCount, buildingCount, points int, badges json.RawMessage) error {

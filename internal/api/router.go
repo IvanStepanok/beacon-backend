@@ -85,6 +85,10 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, h *handler.Handlers, logge
 		r.Get("/config", h.GetConfig)
 		r.With(requireMutator).Patch("/config", h.PatchConfig)
 
+		// modular capture-form schema (public: the anonymous mobile app downloads
+		// the Appendix-1 sections, resolved with the crisis's overrides)
+		r.Get("/form-schema", h.GetFormSchema)
+
 		// stats (analyst, scoped)
 		r.With(requireAnalyst).Get("/stats/overview", h.StatsOverview)
 
@@ -94,8 +98,8 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, h *handler.Handlers, logge
 			r.Get("/active", h.ActiveCrisis)
 			r.Get("/near", h.NearbyCrises) // public: mobile location-first launch
 			r.Get("/{id}", h.GetCrisis)
-			r.Get("/{id}/danger-zones", h.DangerZones)
 			r.With(requireMutator).Patch("/{id}/status", h.SetCrisisStatus) // analyst confirm/dismiss emergent
+			r.With(requireMutator).Patch("/{id}/form", h.PatchCrisisForm)   // senior analyst adjusts the modular form
 		})
 
 		// external disaster feeds (USGS/GDACS) — analyst-triggered on-demand refresh

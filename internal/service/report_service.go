@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -50,11 +52,12 @@ const (
 	rateLimitSustainedMax    = 20               // max reports …
 	rateLimitSustainedWindow = 10 * time.Minute // … per this longer window
 
-	// Dedup: a building-less pin from the same submitter within this radius AND time
-	// of a previous building-less pin is treated as a duplicate (409). Reports that
-	// carry a building_id are NOT rejected here — the per-building version chain
-	// (NextVersionForBuilding) already supersedes/merges them, which is the desired
-	// behavior, so we let that path handle same-submitter+same-building re-reports.
+	// Dedup: a pin from the same submitter within this radius AND time of a previous
+	// pin is treated as a duplicate (409). Only a REAL tapped footprint is exempt
+	// (buildingSource=="footprint", or the legacy "fp-" id prefix): re-reporting a
+	// footprint is the per-building version chain's job (NextVersionForBuilding
+	// supersedes/merges it). Synthetic GPS-grid "b-" building ids are derived from
+	// the pin itself, so they get the same dedup as building-less pins.
 	dedupRadiusMeters  = 25.0
 	dedupWindowSeconds = 600.0 // 10 minutes
 )
@@ -114,12 +117,15 @@ func normalize(req model.SubmitReportRequest, submitterID *string) (model.Report
 		r.InfraTypes = []string{}
 	}
 	r.InfraOtherDetail = req.InfraOtherDetail
+	r.InfraName = req.InfraName
 	r.CrisisNature = req.CrisisNature
 	if len(r.CrisisNature) == 0 {
 		r.CrisisNature = req.Crisis // alias
 	}
-	if len(r.CrisisNature) == 0 {
-		r.CrisisNature = []string{"earthquake"}
+	// NO hazard default: an empty crisisNature stays empty — the server must never
+	// fabricate an "earthquake" the reporter did not assert.
+	if r.CrisisNature == nil {
+		r.CrisisNature = []string{}
 	}
 
 	// location (C4): a report has EITHER a resolved point (GPS fix or tapped footprint)
@@ -157,14 +163,35 @@ func normalize(req model.SubmitReportRequest, submitterID *string) (model.Report
 		return nil
 	}
 	r.BuildingID = pick(req.BuildingID, func() *string { return req.Location.BuildingID })
-	r.What3Words = pick(req.What3Words, func() *string { return req.Location.What3Words })
+	r.BuildingSource = pick(req.BuildingSource, func() *string { return req.Location.BuildingSource })
+	// buildingSource is a TRUST claim, not free metadata: "footprint" exempts the
+	// report from the near-dup guard (isFootprintReport), so it must never be stored
+	// verbatim. Only the one defined value is accepted; anything else — fabricated
+	// strings included — normalizes to nil. The legacy "fp-" id-prefix exemption for
+	// older clients is unaffected.
+	if r.BuildingSource != nil && *r.BuildingSource != "footprint" {
+		r.BuildingSource = nil
+	}
+	// plusCode is canonical; the legacy what3words key (which always carried a plus
+	// code) is accepted as a fallback for older clients. One value is stored
+	// (plus_code) and responses emit it under BOTH keys (see store.scanReport).
 	r.PlusCode = pick(req.PlusCode, func() *string { return req.Location.PlusCode })
+	if r.PlusCode == nil {
+		r.PlusCode = pick(req.What3Words, func() *string { return req.Location.What3Words })
+	}
+	r.What3Words = r.PlusCode
 	r.Landmark = pick(req.Landmark, func() *string { return req.Location.Landmark })
 	// Accuracy: the C4 wire field `accuracyMeters` is an alias; coalesce
 	// accuracyMeters || gpsAccuracyMeters || location.gpsAccuracyMeters.
 	r.GPSAccuracyMeters = pick2(req.AccuracyMeters, req.GPSAccuracyMeters, req.Location)
 
 	r.Place = req.Place
+	// place sanitation: "Your location" is a client UI placeholder, not a real place
+	// name — store the empty value instead (this schema's "no place"; AreaGroups
+	// already treats '' as absent).
+	if strings.EqualFold(strings.TrimSpace(r.Place), "your location") {
+		r.Place = ""
+	}
 	r.Description = req.Description
 	r.AILevel = req.AILevel
 	r.AIConfidence = req.AIConfidence
@@ -237,6 +264,46 @@ func pick2(alias, flat *float64, loc *model.ReportLocation) *float64 {
 	return nil
 }
 
+// isFootprintReport reports whether a report's building came from a REAL tapped
+// footprint polygon: buildingSource=="footprint" (current clients) or the "fp-"
+// building-id prefix (legacy clients that predate buildingSource). Synthetic
+// GPS-grid "b-" ids — derived from the pin location, not a building tap — and any
+// other ids are NOT footprints, so they do not bypass the near-dup guard.
+func isFootprintReport(r model.Report) bool {
+	if r.BuildingSource != nil && *r.BuildingSource == "footprint" {
+		return true
+	}
+	return r.BuildingID != nil && strings.HasPrefix(*r.BuildingID, "fp-")
+}
+
+// pinContainmentLimitKm is how far from a crisis's center a pinned report may fall
+// before the pin is ignored: max(radius*1.5, radius+5) km — proportional slack for
+// large crises, a fixed 5 km floor of slack for small ones.
+func pinContainmentLimitKm(radiusKm float64) float64 {
+	return math.Max(radiusKm*1.5, radiusKm+5.0)
+}
+
+// pinOutsideContainment reports whether a resolved point is too far from a pinned
+// crisis's center to plausibly belong to it (a stale pin from a previously browsed
+// crisis). A crisis without a usable radius (radiusKm <= 0) never un-pins.
+func pinOutsideContainment(lat, lng float64, c model.Crisis) bool {
+	if c.RadiusKm <= 0 {
+		return false
+	}
+	return haversineKm(lat, lng, c.CenterLat, c.CenterLng) > pinContainmentLimitKm(c.RadiusKm)
+}
+
+// haversineKm is the great-circle distance between two WGS84 points in km.
+func haversineKm(lat1, lng1, lat2, lng2 float64) float64 {
+	const earthRadiusKm = 6371.0
+	toRad := func(deg float64) float64 { return deg * math.Pi / 180 }
+	dLat := toRad(lat2 - lat1)
+	dLng := toRad(lng2 - lng1)
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(toRad(lat1))*math.Cos(toRad(lat2))*math.Sin(dLng/2)*math.Sin(dLng/2)
+	return 2 * earthRadiusKm * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+}
+
 func validate(r model.Report) error {
 	if r.ID == "" {
 		return ValidationError{"id is required (client-supplied for idempotency)"}
@@ -247,10 +314,21 @@ func validate(r model.Report) error {
 	if !contains(model.DebrisStates, r.Debris) {
 		return ValidationError{fmt.Sprintf("debris must be one of %v", model.DebrisStates)}
 	}
+	// Infrastructure type + crisis nature are core multi-select questions the brief
+	// requires users to answer to submit (challenge.md). Enforce them server-side so
+	// the contract holds for ANY client, not only the Beacon app. (Photo is a core
+	// indicator too, but it arrives via the two-phase upload after submit — its
+	// completeness is enforced at verification by the photo-gate, not here.)
+	if len(r.InfraTypes) == 0 {
+		return ValidationError{"at least one infrastructure type is required"}
+	}
 	for _, it := range r.InfraTypes {
 		if !contains(model.InfraTypesAll, it) {
 			return ValidationError{fmt.Sprintf("invalid infraType %q", it)}
 		}
+	}
+	if len(r.CrisisNature) == 0 {
+		return ValidationError{"crisis nature is required"}
 	}
 	for _, cn := range r.CrisisNature {
 		if !contains(model.CrisisNatures, cn) {
@@ -287,10 +365,11 @@ func validate(r model.Report) error {
 //     created_at) over both the burst and sustained windows. Over either cap → 429.
 //     Counting committed rows in the DB makes this robust across process restarts
 //     (an in-memory bucket alone would reset on every redeploy).
-//  2. DEDUP — reject a building-less near-duplicate (same submitter, within
-//     dedupRadiusMeters + dedupWindowSeconds) with 409 referencing the existing
-//     report. Reports that carry a building_id are intentionally NOT rejected here:
-//     the per-building version chain already supersedes/merges them (see Submit).
+//  2. DEDUP — reject a near-duplicate (same submitter, within dedupRadiusMeters +
+//     dedupWindowSeconds) with 409 referencing the existing report. Only a REAL
+//     tapped footprint (buildingSource=="footprint" / legacy "fp-" id prefix) is
+//     exempt: the per-building version chain already supersedes/merges those (see
+//     Submit). Synthetic GPS-grid "b-" ids get the check like building-less pins.
 func (s *ReportService) enforceSubmitGuards(ctx context.Context, submitterID string, r model.Report) error {
 	now := time.Now().UTC()
 
@@ -309,12 +388,12 @@ func (s *ReportService) enforceSubmitGuards(ctx context.Context, submitterID str
 		return RateLimitError{Msg: fmt.Sprintf("rate limit: at most %d reports per %s", rateLimitSustainedMax, rateLimitSustainedWindow)}
 	}
 
-	// Building-less dedup only (building re-reports are merged via the version chain).
-	// Skip the radius dedup entirely for a location-unresolved report — it has no point
-	// to ST_DWithin against. (Resolved building-less pins still go through the check.)
-	if (r.BuildingID == nil || *r.BuildingID == "") && r.Lat != nil && r.Lng != nil {
+	// Radius dedup for every resolved pin EXCEPT a real tapped footprint (footprint
+	// re-reports are merged via the version chain). Skip it entirely for a
+	// location-unresolved report — it has no point to ST_DWithin against.
+	if !isFootprintReport(r) && r.Lat != nil && r.Lng != nil {
 		existingID, found, err := s.reports.FindDuplicateBySubmitter(
-			ctx, submitterID, r.BuildingID, *r.Lat, *r.Lng, r.CapturedAt,
+			ctx, submitterID, *r.Lat, *r.Lng, r.CapturedAt,
 			dedupRadiusMeters, dedupWindowSeconds, r.ID)
 		if err != nil {
 			return err
@@ -364,6 +443,18 @@ func (s *ReportService) Submit(ctx context.Context, req model.SubmitReportReques
 		// a point outside known boundaries simply leaves admin unset.
 		if chain, err := s.admin.ResolveAdmin(ctx, lng, lat); err == nil && chain != nil {
 			r.Admin = chain
+		}
+
+		// Geographic containment for a client-pinned crisis: when the pin's crisis has
+		// a center+radius and this resolved point falls far outside it (beyond
+		// max(radius*1.5, radius+5) km), the pin is almost certainly stale — e.g. the
+		// app kept a previously browsed crisis selected. IGNORE the pin and let the
+		// normal spatial assignment below decide; the report is never rejected for
+		// this. Landmark-only (no-coords) reports never reach here and keep their pin.
+		if r.CrisisID != "" && s.crises != nil {
+			if c, err := s.crises.Get(ctx, r.CrisisID); err == nil && c != nil && pinOutsideContainment(lat, lng, *c) {
+				r.CrisisID = ""
+			}
 		}
 
 		// Server-side crisis assignment by space+time (unless the client pinned one).
@@ -446,8 +537,10 @@ func (s *ReportService) Submit(ctx context.Context, req model.SubmitReportReques
 	// just completed a spatiotemporal cluster of pending reports → propose a crisis
 	// and pull them in (analyst confirms later). Best-effort; never fails the submit.
 	// Requires a resolved point (an unresolved report cannot anchor a spatial cluster).
+	// The crisis title/area come from the admin-boundary resolve at the centroid —
+	// never from a report's free-text place.
 	if inserted && r.CrisisID == "" && s.crises != nil && r.Lat != nil && r.Lng != nil {
-		_, _ = s.crises.DetectEmergentCrisis(ctx, *r.Lat, *r.Lng, r.CapturedAt)
+		_, _ = s.crises.DetectEmergentCrisis(ctx, *r.Lat, *r.Lng, r.CapturedAt, s.emergentAreaName)
 	}
 
 	// Lazily ensure this point's country has admin boundaries loaded, so this report
@@ -468,4 +561,24 @@ func (s *ReportService) Submit(ctx context.Context, req model.SubmitReportReques
 		return nil, false, err
 	}
 	return stored, inserted, nil
+}
+
+// emergentAreaName resolves the DEEPEST available admin-area name (ADM2 > ADM1 >
+// ADM0) for an emergent-crisis centroid via the admin_areas reverse-geocode.
+// Returns "" when the point falls outside known boundaries — DetectEmergentCrisis
+// then falls back to a coordinate-based title (never a report's free-text place).
+func (s *ReportService) emergentAreaName(ctx context.Context, lat, lng float64) string {
+	chain, err := s.admin.ResolveAdmin(ctx, lng, lat)
+	if err != nil || chain == nil {
+		return ""
+	}
+	switch {
+	case chain.Adm2 != nil:
+		return chain.Adm2.Name
+	case chain.Adm1 != nil:
+		return chain.Adm1.Name
+	case chain.Adm0 != nil:
+		return chain.Adm0.Name
+	}
+	return ""
 }

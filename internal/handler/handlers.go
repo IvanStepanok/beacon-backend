@@ -77,8 +77,9 @@ func coarsen(x float64) float64 {
 // photoUrl ONLY when the report is verified. Everything else is cleared:
 //
 //   - identity / location precision: submitterId, what3words (~3m), plusCode,
-//     free-text landmark, buildingId, gpsAccuracy — each would de-coarsen the
-//     ~110m grid or de-anonymize the reporter (flat fields AND the nested location);
+//     free-text landmark, buildingId, buildingSource, infraName, gpsAccuracy — each
+//     would de-coarsen the ~110m grid or de-anonymize the reporter (flat fields AND
+//     the nested location);
 //   - operational / PII / analyst-only fields: description (free-text + reporter
 //     language, can carry PII), assignee, taskStatus, taskRef, disposition, severity,
 //     lifeSafety, clusters, the raw AI level/confidence, the modular blob, and the
@@ -101,6 +102,7 @@ func publicProjection(rep model.Report) model.Report {
 	rep.PlusCode = nil
 	rep.Landmark = nil
 	rep.BuildingID = nil
+	rep.BuildingSource = nil
 	rep.GPSAccuracyMeters = nil
 	rep.Location.Lat = rep.Lat
 	rep.Location.Lng = rep.Lng
@@ -108,9 +110,13 @@ func publicProjection(rep model.Report) model.Report {
 	rep.Location.PlusCode = nil
 	rep.Location.Landmark = nil
 	rep.Location.BuildingID = nil
+	rep.Location.BuildingSource = nil
 	rep.Location.GPSAccuracyMeters = nil
 
-	// Operational / PII / analyst-only fields.
+	// Operational / PII / analyst-only fields. infraName is reporter free-text that
+	// names a specific building — combined with the coarsened point it could
+	// de-coarsen the grid, so it is stripped like description/landmark.
+	rep.InfraName = nil
 	rep.Description = nil
 	rep.Assignee = nil
 	rep.TaskStatus = ""

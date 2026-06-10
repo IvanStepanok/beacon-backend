@@ -5,12 +5,18 @@
 // The damage scale is now 5-level EMS-98 (none:12/slight:17/moderate:11/severe:6/
 // destroyed:10) — the dashboard mock will be re-pointed at this contract when the
 // clients are wired to the live API. Runs only on an empty reports table (idempotent).
+//
+// All timestamps are RELATIVE to seed time (crisis started seedCrisisWindow ago,
+// captures spread deterministically across it) so the demo reads as a live
+// operation whenever it is seeded. Real embedded evidence photos (photos.go) are
+// installed into PHOTO_DIR and attached to every verified report.
 package seed
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math"
 	"sort"
@@ -59,6 +65,17 @@ const (
 	antakyaLat = 36.2021
 	antakyaLng = 36.1601
 	crisisID   = "crisis-antakya"
+
+	// seedCrisisWindow is how long before SEED TIME the demo crisis started.
+	// Captures spread deterministically across it (offsets come from the same
+	// rnd(fi+200) draw as before), so the dataset always reads as a live
+	// multi-day operation — never a frozen calendar date that looks dead by
+	// the time it is evaluated.
+	seedCrisisWindow = 72 * time.Hour
+
+	// seedReportSpreadMin caps a seeded capture's age so every report falls
+	// strictly INSIDE the crisis window (latest possible age + margin < window).
+	seedReportSpreadMin = int(seedCrisisWindow/time.Minute) - 90
 )
 
 // rnd mirrors the dashboard: frac(sin(seed*127.1+311.7)*43758.5453). Go float64
@@ -107,6 +124,16 @@ var (
 )
 
 func strptr(s string) *string { return &s }
+
+// footprintID derives a deterministic footprint-style building id from a report's
+// point — the seed's stand-in for the mobile client's real footprint ids (hashed
+// from the tapped polygon). Same point ⇒ same id, so seeded re-reports keep
+// forming believable per-building version chains.
+func footprintID(lat, lng float64) string {
+	h := fnv.New32a()
+	fmt.Fprintf(h, "%.6f:%.6f", lat, lng)
+	return fmt.Sprintf("fp-%08x", h.Sum32())
+}
 
 // clusterFor routes an infrastructure type to its lead cluster (2026 model).
 var clusterFor = map[string]string{
@@ -173,8 +200,11 @@ func modularFor(i int, dmg string) json.RawMessage {
 }
 
 // BuildReports reproduces the dashboard's 56-report Antakya set. captured_at is
-// derived from the dashboard ageMin relative to base, so the server-computed
-// ageMin matches at seed time and ages naturally afterwards.
+// base − ageMin, with ageMin drawn from the same rnd(fi+200) sequence as the
+// dashboard mock but scaled across the full crisis window, so the dataset reads
+// as a live multi-day operation at seed time and ages naturally afterwards.
+// Photos/SizeBytes start empty/0 — assignSeedPhotos attaches the real embedded
+// evidence (and its honest byte size) afterwards.
 func BuildReports(base time.Time) []model.Report {
 	out := make([]model.Report, 0, 56)
 	for i := 0; i < 56; i++ {
@@ -183,13 +213,24 @@ func BuildReports(base time.Time) []model.Report {
 		possibly := rnd(fi+900) > 0.82 // ~18% flagged "possibly damaged" (reporter unsure)
 		lat := antakyaLat + (rnd(fi)-0.5)*0.05
 		lng := antakyaLng + (rnd(fi+50)-0.5)*0.05
-		ageMin := int(math.Floor(rnd(fi+200)*660)) + 1
+		ageMin := int(math.Floor(rnd(fi+200)*float64(seedReportSpreadMin))) + 1
 		synced := rnd(fi+300) > 0.28
 		hasDesc := rnd(fi+400) > 0.5
 		hasAI := rnd(fi+500) > 0.4
 		id := fmt.Sprintf("%d", 1156+i)
-		buildingID := fmt.Sprintf("b-%d-%d", int(math.Floor(lat*10000)), int(math.Floor(lng*10000)))
-		sizeMb := math.Round((1.3+rnd(fi+600)*2.4)*10) / 10
+		// Building identity mirrors the REAL mobile capture mix: ~60% of reports
+		// come from a tapped footprint polygon (deterministic "fp-" id WITH the
+		// buildingSource provenance, so version chains stay believable), the rest
+		// are GPS pin-only — the new normal for a reporter who never taps a
+		// footprint. The old synthetic "b-<grid>" ids fabricated a building
+		// identity from the pin itself (exactly what mobile removed) and must not
+		// be resurrected here. rnd() is seed-keyed (stateless), so the golden
+		// parity draws (fi … fi+990) are untouched by the extra fi+1000 draw.
+		var buildingID, buildingSource *string
+		if rnd(fi+1000) < 0.6 {
+			buildingID = strptr(footprintID(lat, lng))
+			buildingSource = strptr("footprint")
+		}
 
 		r := model.Report{
 			ID:               id,
@@ -204,17 +245,23 @@ func BuildReports(base time.Time) []model.Report {
 			Lat:              &lat,
 			Lng:              &lng,
 			LocationResolved: true,
-			BuildingID:       strptr(buildingID),
+			BuildingID:       buildingID,
+			BuildingSource:   buildingSource,
 			Version:          1,
-			What3Words:       strptr("garden.tribe.sparkle"),
+			PlusCode:         strptr("8G7F6526+VC"),
 			Place:            places[i%len(places)],
 			Photos:           []model.PhotoRef{},
-			SizeBytes:        int64(math.Round(sizeMb * 1e6)),
+			SizeBytes:        0, // honest: set from the real photo size in assignSeedPhotos
 			Anonymization:    model.DefaultAnonymization(),
 			Synced:           synced,
 			Modular:          modularFor(i, dmg),
 			CapturedAt:       base.Add(-time.Duration(ageMin) * time.Minute),
 		}
+		// created_at: the report reached the server a short, deterministic
+		// offline-sync lag after capture — seeded history must not all "arrive"
+		// at seed time (live rows get created_at = now at insert).
+		r.CreatedAt = r.CapturedAt.Add(time.Duration(int(math.Floor(rnd(fi+650)*45))+2) * time.Minute)
+		r.UpdatedAt = r.CreatedAt
 		if synced {
 			r.Sync = json.RawMessage(`{"type":"Synced"}`)
 		} else {
@@ -277,12 +324,6 @@ func BuildReports(base time.Time) []model.Report {
 	return out
 }
 
-var dangerZones = []model.DangerZone{
-	{ID: "dz-1", CrisisID: crisisID, Name: "Saray Cd. overpass", Note: "Partial collapse — structurally unsafe.", Severity: "critical"},
-	{ID: "dz-2", CrisisID: crisisID, Name: "Pazar Sk. market block", Note: "Gas leak reported — avoid until cleared.", Severity: "warning"},
-	{ID: "dz-3", CrisisID: crisisID, Name: "Riverside Demir Mh.", Note: "Debris and unstable façades.", Severity: "caution"},
-}
-
 // mahalle holds the seeded ADM3 neighbourhood names (illustrative, pending real
 // Türkiye COD-AB ingest); pcodes follow the TR63 (Hatay) → TR6303 (Antakya) chain.
 var mahalle = []string{
@@ -326,8 +367,10 @@ func seedAdminAreas(ctx context.Context, pool *pgxpool.Pool, admin *store.Admin)
 	return nil
 }
 
-// Run seeds the database if (and only if) the reports table is empty.
-func Run(ctx context.Context, pool *pgxpool.Pool, reports *store.Reports, crises *store.Crises, admin *store.Admin, users *store.Users, dataset string, logger *slog.Logger) error {
+// Run seeds the database if (and only if) the reports table is empty. photoDir
+// is the live PHOTO_DIR — the embedded evidence photos are installed there so
+// seeded photoUrls serve real images through GET /reports/{id}/photo.
+func Run(ctx context.Context, pool *pgxpool.Pool, reports *store.Reports, crises *store.Crises, admin *store.Admin, users *store.Users, dataset, photoDir string, logger *slog.Logger) error {
 	// Users seed independently of reports (gated by their own count).
 	if err := seedUsers(ctx, users, logger); err != nil {
 		return fmt.Errorf("seed users: %w", err)
@@ -347,35 +390,40 @@ func Run(ctx context.Context, pool *pgxpool.Pool, reports *store.Reports, crises
 
 	base := time.Now().UTC()
 
-	// crisis
+	// crisis — started a full seedCrisisWindow before seed time, so every seeded
+	// capture (spread over seedReportSpreadMin) falls after the crisis began.
 	glide := "EQ-2026-000042-TUR"
 	level := 2
 	if err := crises.UpsertCrisis(ctx, model.Crisis{
 		ID: crisisID, Title: "Earthquake M 6.4", Area: "Antakya district, Hatay",
 		Nature: "earthquake", CenterLat: antakyaLat, CenterLng: antakyaLng,
-		Source: "UNDP RAPIDA", StartedAt: base.Add(-3 * time.Hour),
+		Source: "UNDP RAPIDA", StartedAt: base.Add(-seedCrisisWindow),
 		Glide: &glide, ResponseLevel: &level,
 		RadiusKm: 25, Status: "active",
 	}); err != nil {
 		return fmt.Errorf("seed crisis: %w", err)
-	}
-	for _, dz := range dangerZones {
-		if err := crises.UpsertDangerZone(ctx, dz); err != nil {
-			return fmt.Errorf("seed danger zone: %w", err)
-		}
 	}
 	badges := json.RawMessage(`[{"id":"first","name":"First responder","earned":true},{"id":"streets","name":"Street mapper","earned":true},{"id":"verified","name":"Verified eyes","earned":false,"progressLabel":"3/5 verified"}]`)
 	if err := crises.UpsertSubmitter(ctx, "A4-92K", nil, 12, 8, 120, badges); err != nil {
 		return fmt.Errorf("seed submitter: %w", err)
 	}
 
+	photos, err := loadSeedPhotos()
+	if err != nil {
+		return fmt.Errorf("load seed photos: %w", err)
+	}
+
 	reps := BuildReports(base)
 	if dataset == "mobile" || dataset == "both" {
 		reps = append(reps, buildVersionChain(base)...)
 	}
+	// Attach the real embedded evidence photos BEFORE sorting (the round-robin
+	// assignment is index-keyed, so it must see the deterministic build order).
+	assignSeedPhotos(reps, photos)
 	// Insert oldest-first so each building's cached current_damage ends as the newest version.
 	sort.SliceStable(reps, func(a, b int) bool { return reps[a].CapturedAt.Before(reps[b].CapturedAt) })
 
+	withPhoto := 0
 	for _, r := range reps {
 		// reverse-geocode via the same DB path live submits use (seeded reports are
 		// always resolved, so r.Lat/r.Lng are non-nil here).
@@ -394,35 +442,53 @@ func Run(ctx context.Context, pool *pgxpool.Pool, reports *store.Reports, crises
 		if _, err := store.UpsertReport(ctx, pool, r); err != nil {
 			return fmt.Errorf("seed report %s: %w", r.ID, err)
 		}
+		// Mirror the live photo flow: write the image into PHOTO_DIR, then record
+		// photo_url (UpsertReport never carries photo_url — uploads set it).
+		if r.PhotoURL != nil {
+			if err := installSeedPhoto(photoDir, r, photos); err != nil {
+				return fmt.Errorf("seed photo %s: %w", r.ID, err)
+			}
+			if _, err := reports.SetPhotoURL(ctx, r.ID, *r.PhotoURL); err != nil {
+				return fmt.Errorf("seed photo url %s: %w", r.ID, err)
+			}
+			withPhoto++
+		}
 	}
-	logger.Info("seed complete", "reports", len(reps), "dataset", dataset)
+	logger.Info("seed complete", "reports", len(reps), "withPhoto", withPhoto, "dataset", dataset)
 	return nil
 }
 
-// buildVersionChain creates a 3-version history for one building (b-47) to
-// demonstrate the per-building timeline (mobile scenario).
+// buildVersionChain creates a 3-version history for one tapped footprint to
+// demonstrate the per-building timeline (mobile scenario): slight ~2 days ago,
+// severe ~1 day ago, destroyed ~2 hours ago — a deterioration spanning the
+// crisis window. A version chain only exists for a REAL footprint (re-reporting
+// one is the chain's job), so each entry carries the fp- id + buildingSource.
+// Sizes start 0 — assignSeedPhotos attaches the real evidence.
 func buildVersionChain(base time.Time) []model.Report {
-	bid := "b-47"
 	vLat, vLng := antakyaLat+0.004, antakyaLng+0.004
+	bid := footprintID(vLat, vLng)
 	mk := func(idn int, dmg string, ageMin int, sup *string) model.Report {
 		id := fmt.Sprintf("%d", 1300+idn)
 		lat, lng := vLat, vLng // fresh addresses per report
+		captured := base.Add(-time.Duration(ageMin) * time.Minute)
 		return model.Report{
 			ID: id, IdempotencyKey: "idem-" + id, CrisisID: crisisID,
 			Damage: dmg, Verification: "pending", Debris: "unsure",
 			InfraTypes: []string{"residential"}, CrisisNature: []string{"earthquake"},
-			Lat: &lat, Lng: &lng, LocationResolved: true, BuildingID: &bid,
+			Lat: &lat, Lng: &lng, LocationResolved: true,
+			BuildingID: &bid, BuildingSource: strptr("footprint"),
 			Version: idn, SupersedesReportID: sup, Place: "Saray Cd.",
-			Photos: []model.PhotoRef{}, SizeBytes: 1_800_000,
+			Photos: []model.PhotoRef{}, SizeBytes: 0,
 			Anonymization: model.DefaultAnonymization(), Synced: true,
 			Sync: json.RawMessage(`{"type":"Synced"}`), IsMine: true,
-			CapturedAt: base.Add(-time.Duration(ageMin) * time.Minute),
+			CapturedAt: captured,
+			CreatedAt:  captured.Add(5 * time.Minute), UpdatedAt: captured.Add(5 * time.Minute),
 		}
 	}
-	v1 := mk(1, "slight", 320, nil)
+	v1 := mk(1, "slight", 2880, nil)
 	id1 := v1.ID
-	v2 := mk(2, "severe", 160, &id1)
+	v2 := mk(2, "severe", 1440, &id1)
 	id2 := v2.ID
-	v3 := mk(3, "destroyed", 20, &id2)
+	v3 := mk(3, "destroyed", 120, &id2)
 	return []model.Report{v1, v2, v3}
 }

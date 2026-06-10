@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"math"
 
 	"github.com/stepanok/beacon-server/internal/model"
 )
@@ -49,31 +50,52 @@ func (s *Reports) TaskStats(ctx context.Context, crisisID string) (tc model.Task
 	return
 }
 
-// TimeSeries returns 12 hourly buckets (hour 11 oldest .. 0 = now), mirroring the
-// dashboard's bucketing: h = min(11, floor(ageMin/60)).
-func (s *Reports) TimeSeries(ctx context.Context, crisisID string) ([]model.TimeBucket, error) {
+// TimeSeries returns activity buckets (index N-1 oldest .. 0 = now), mirroring the
+// dashboard's bucketing: idx = min(N-1, floor(ageMin/width)). The width adapts to
+// the crisis age so the chart stays meaningful long after onset: up to 48h it keeps
+// the original 12 hourly buckets; older crises switch to daily buckets covering the
+// span (min 7, capped at 30 days). The returned unit is "hour" or "day".
+func (s *Reports) TimeSeries(ctx context.Context, crisisID string) ([]model.TimeBucket, string, error) {
+	// Crisis age picks the bucket width; an unknown crisis keeps the hourly view.
+	var ageHours float64
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(EXTRACT(EPOCH FROM (now()-started_at))/3600, 0) FROM crises WHERE id = $1`,
+		crisisID).Scan(&ageHours); err != nil {
+		ageHours = 0
+	}
+	unit, width, n := "hour", 60, 12 // width in minutes
+	if ageHours > 48 {
+		unit, width = "day", 60*24
+		n = int(math.Ceil(ageHours / 24))
+		if n < 7 {
+			n = 7 // at least a week so early daily charts don't render a few giant bars
+		}
+		if n > 30 {
+			n = 30
+		}
+	}
 	rows, err := s.pool.Query(ctx, `
 		WITH ages AS (
-			SELECT LEAST(11, FLOOR(GREATEST(0, EXTRACT(EPOCH FROM (now()-captured_at))/60) / 60))::int AS hour
+			SELECT LEAST($2::int - 1, FLOOR(GREATEST(0, EXTRACT(EPOCH FROM (now()-captured_at))/60) / $3))::int AS bucket
 			FROM reports WHERE crisis_id = $1
 		)
-		SELECT g AS hour, COALESCE(c.cnt, 0) AS cnt
-		FROM generate_series(0,11) g
-		LEFT JOIN (SELECT hour, count(*) cnt FROM ages GROUP BY hour) c ON c.hour = g
-		ORDER BY g DESC`, crisisID)
+		SELECT g AS bucket, COALESCE(c.cnt, 0) AS cnt
+		FROM generate_series(0, $2::int - 1) g
+		LEFT JOIN (SELECT bucket, count(*) cnt FROM ages GROUP BY bucket) c ON c.bucket = g
+		ORDER BY g DESC`, crisisID, n, width)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer rows.Close()
-	out := make([]model.TimeBucket, 0, 12)
+	out := make([]model.TimeBucket, 0, n)
 	for rows.Next() {
 		var b model.TimeBucket
 		if err := rows.Scan(&b.Hour, &b.Count); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		out = append(out, b)
 	}
-	return out, rows.Err()
+	return out, unit, rows.Err()
 }
 
 // Recent returns the newest n reports for a crisis.
@@ -85,48 +107,6 @@ func (s *Reports) Recent(ctx context.Context, crisisID string, n int) ([]model.R
 		return nil, err
 	}
 	return scanReports(rows)
-}
-
-// PdnaPivot aggregates damage COUNTS by (admin area × sector) — PDNA-ready damage-
-// count aggregates that feed a PDNA, NOT a loss/cost estimation. Each report
-// contributes one row per infrastructure type (LATERAL unnest), grouped by ADM2 and
-// sector. The CANONICAL breakdown is the 3-tier rollup (minimal/partial/complete),
-// computed off damage_tier so it is vocabulary-agnostic and minimal+partial+complete
-// == total per row (no report is dropped or mis-bucketed). The 5-level EMS-98
-// columns are kept as detail and only carry counts for ems98-scale reports.
-func (s *Reports) PdnaPivot(ctx context.Context, crisisID string) ([]model.PdnaRow, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT COALESCE(adm2_pcode, '') AS pcode,
-		       COALESCE(admin->'adm2'->>'name', '(unassigned)') AS name,
-		       sector,
-		       count(*) FILTER (WHERE damage_tier='minimal'),
-		       count(*) FILTER (WHERE damage_tier='partial'),
-		       count(*) FILTER (WHERE damage_tier='complete'),
-		       count(*) FILTER (WHERE damage='none'),
-		       count(*) FILTER (WHERE damage='slight'),
-		       count(*) FILTER (WHERE damage='moderate'),
-		       count(*) FILTER (WHERE damage='severe'),
-		       count(*) FILTER (WHERE damage='destroyed'),
-		       count(*) AS total
-		FROM reports, unnest(infra_types) AS sector
-		WHERE crisis_id = $1
-		GROUP BY adm2_pcode, admin->'adm2'->>'name', sector
-		ORDER BY pcode, sector`, crisisID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []model.PdnaRow{}
-	for rows.Next() {
-		var p model.PdnaRow
-		if err := rows.Scan(&p.AdmPcode, &p.AdmName, &p.Sector,
-			&p.Minimal, &p.Partial, &p.Complete,
-			&p.None, &p.Slight, &p.Moderate, &p.Severe, &p.Destroyed, &p.Total); err != nil {
-			return nil, err
-		}
-		out = append(out, p)
-	}
-	return out, rows.Err()
 }
 
 // ExportRows streams all reports matching a filter (no pagination) for export.

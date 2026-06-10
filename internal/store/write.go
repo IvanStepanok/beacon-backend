@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -23,24 +24,26 @@ type querier interface {
 const insertReportSQL = `
 INSERT INTO reports (
   id, idempotency_key, crisis_id, submitter_id, damage, possibly_damaged, verification, debris,
-  infra_types, infra_other_detail, crisis_nature, geom, lat, lng, gps_accuracy_m, building_id,
-  version, supersedes_report_id, what3words, plus_code, landmark, place,
+  infra_types, infra_other_detail, infra_name, crisis_nature, geom, lat, lng, gps_accuracy_m,
+  building_id, building_source,
+  version, supersedes_report_id, plus_code, landmark, place,
   desc_original, desc_original_lang, desc_translated, desc_translated_lang,
   ai_level, ai_confidence, photos, size_bytes, modular, anonymization,
   is_mine, synced, sync_state, captured_at, created_at, updated_at, admin,
   task_status, disposition, assignee, task_ref, severity, life_safety, clusters,
   location_resolved
 ) VALUES (
-  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-  $11,
-  CASE WHEN $12::float8 IS NULL OR $13::float8 IS NULL THEN NULL ELSE ST_SetSRID(ST_MakePoint($12,$13),4326) END,
-  $13, $12, $14, $15,
-  $16,$17,$18,$19,$20,$21,
-  $22,$23,$24,$25,
-  $26,$27,$28,$29,$30,$31,
-  $32,$33,$34,$35,$36,$37,$38,
-  $39,$40,$41,$42,$43,$44,$45,
-  $46
+  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+  $12,
+  CASE WHEN $13::float8 IS NULL OR $14::float8 IS NULL THEN NULL ELSE ST_SetSRID(ST_MakePoint($13,$14),4326) END,
+  $14, $13, $15,
+  $16,$17,
+  $18,$19,$20,$21,$22,
+  $23,$24,$25,$26,
+  $27,$28,$29,$30,$31,$32,
+  $33,$34,$35,$36,$37,$38,$39,
+  $40,$41,$42,$43,$44,$45,$46,
+  $47
 ) ON CONFLICT (id) DO NOTHING`
 
 // UpsertReport inserts a fully-formed report idempotently (ON CONFLICT (id) DO
@@ -103,8 +106,9 @@ func UpsertReport(ctx context.Context, q querier, r model.Report) (inserted bool
 	// CASE leaves geom NULL when either is NULL (a location-unresolved report).
 	tag, err := q.Exec(ctx, insertReportSQL,
 		r.ID, r.IdempotencyKey, crisisID, r.SubmitterID, r.Damage, r.PossiblyDamaged, r.Verification, r.Debris,
-		r.InfraTypes, r.InfraOtherDetail, r.CrisisNature, r.Lng, r.Lat, r.GPSAccuracyMeters, r.BuildingID,
-		r.Version, r.SupersedesReportID, r.What3Words, r.PlusCode, r.Landmark, r.Place,
+		r.InfraTypes, r.InfraOtherDetail, r.InfraName, r.CrisisNature, r.Lng, r.Lat, r.GPSAccuracyMeters,
+		r.BuildingID, r.BuildingSource,
+		r.Version, r.SupersedesReportID, r.PlusCode, r.Landmark, r.Place,
 		descO, descOL, descT, descTL,
 		r.AILevel, r.AIConfidence, photos, r.SizeBytes, modular, anon,
 		r.IsMine, r.Synced, sync, r.CapturedAt, r.CreatedAt, r.UpdatedAt, admin,
@@ -170,22 +174,33 @@ func RefreshBuildingCurrentDamage(ctx context.Context, q querier, buildingID str
 	return err
 }
 
-// UpdateVerification persists an analyst decision and writes an audit row in one
-// tx. Returns nil report if the id doesn't exist.
-func (s *Reports) UpdateVerification(ctx context.Context, id, status, actor string) (*model.Report, error) {
+// ErrPhotoRequired → 409 photo_required at the handler: an analyst tried to mark a
+// photo-less report verified without the explicit force=true override.
+var ErrPhotoRequired = errors.New("cannot verify a report without a photo")
+
+// UpdateVerification persists an analyst decision and writes an audit row (incl.
+// the optional note and whether the photo gate was forced) in one tx. Marking a
+// report 'verified' when it has NO photo returns ErrPhotoRequired unless
+// force=true — evidence-less verification is almost always an analyst slip.
+// Returns nil report if the id doesn't exist.
+func (s *Reports) UpdateVerification(ctx context.Context, id, status, actor string, note *string, force bool) (*model.Report, error) {
 	var updated *model.Report
 	err := RunInTx(ctx, s.pool, func(tx pgx.Tx) error {
 		var from string
-		err := tx.QueryRow(ctx, "SELECT verification FROM reports WHERE id = $1 FOR UPDATE", id).Scan(&from)
+		var photoURL *string
+		err := tx.QueryRow(ctx, "SELECT verification, photo_url FROM reports WHERE id = $1 FOR UPDATE", id).Scan(&from, &photoURL)
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				return nil // updated stays nil
 			}
 			return err
 		}
+		if status == "verified" && (photoURL == nil || *photoURL == "") && !force {
+			return ErrPhotoRequired
+		}
 		if _, err := tx.Exec(ctx,
-			"INSERT INTO report_verification_audit (report_id, from_status, to_status, actor) VALUES ($1,$2,$3,$4)",
-			id, from, status, actor); err != nil {
+			"INSERT INTO report_verification_audit (report_id, from_status, to_status, actor, note, forced) VALUES ($1,$2,$3,$4,$5,$6)",
+			id, from, status, actor, note, force); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx,

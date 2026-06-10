@@ -64,7 +64,8 @@ type ReportLocation struct {
 	Lat               *float64 `json:"lat"`
 	Lng               *float64 `json:"lng"`
 	BuildingID        *string  `json:"buildingId,omitempty"`
-	What3Words        *string  `json:"what3words,omitempty"`
+	BuildingSource    *string  `json:"buildingSource,omitempty"` // "footprint" only for a real tapped footprint polygon
+	What3Words        *string  `json:"what3words,omitempty"`     // legacy alias of PlusCode (same value)
 	PlusCode          *string  `json:"plusCode,omitempty"`
 	Landmark          *string  `json:"landmark,omitempty"`
 	GPSAccuracyMeters *float64 `json:"gpsAccuracyMeters,omitempty"`
@@ -126,6 +127,7 @@ type Report struct {
 	InfraTypes       []string `json:"infraTypes"`
 	Infra            []string `json:"infra"` // dashboard alias (same array)
 	InfraOtherDetail *string  `json:"infraOtherDetail,omitempty"`
+	InfraName        *string  `json:"infraName,omitempty"` // name/details of the infrastructure (any type, e.g. "Cumhuriyet Primary School")
 	CrisisNature     []string `json:"crisisNature"`
 	Crisis           []string `json:"crisis"` // dashboard alias (same array)
 
@@ -138,7 +140,8 @@ type Report struct {
 	LocationResolved  bool           `json:"locationResolved"`
 	GPSAccuracyMeters *float64       `json:"gpsAccuracyMeters,omitempty"`
 	BuildingID        *string        `json:"buildingId,omitempty"`
-	What3Words        *string        `json:"what3words,omitempty"`
+	BuildingSource    *string        `json:"buildingSource,omitempty"` // "footprint" ONLY when a real footprint polygon was tapped
+	What3Words        *string        `json:"what3words,omitempty"`     // legacy alias of PlusCode (same value, kept for older mobile builds)
 	PlusCode          *string        `json:"plusCode,omitempty"`
 	Landmark          *string        `json:"landmark,omitempty"`
 	Place             string         `json:"place"`
@@ -197,6 +200,7 @@ type SubmitReportRequest struct {
 	InfraTypes       []string `json:"infraTypes"`
 	Infra            []string `json:"infra"`
 	InfraOtherDetail *string  `json:"infraOtherDetail"`
+	InfraName        *string  `json:"infraName"`
 	CrisisNature     []string `json:"crisisNature"`
 	Crisis           []string `json:"crisis"`
 
@@ -210,7 +214,8 @@ type SubmitReportRequest struct {
 	Location         *ReportLocation `json:"location"`
 
 	BuildingID        *string  `json:"buildingId"`
-	What3Words        *string  `json:"what3words"`
+	BuildingSource    *string  `json:"buildingSource"` // "footprint" ONLY when a real footprint polygon was tapped
+	What3Words        *string  `json:"what3words"`     // legacy submit key — accepted as a plusCode fallback
 	PlusCode          *string  `json:"plusCode"`
 	Landmark          *string  `json:"landmark"`
 	GPSAccuracyMeters *float64 `json:"gpsAccuracyMeters"`
@@ -247,9 +252,15 @@ type TaskRequest struct {
 	Note        *string   `json:"note"`
 }
 
-// VerificationRequest is the analyst PATCH body.
+// VerificationRequest is the analyst PATCH body. `status` is the canonical key;
+// `verification` is the legacy alias older dashboards still send (status wins when
+// both are present). Setting status=verified on a report with no photo is rejected
+// (409 photo_required) unless force=true; note and force land in the audit trail.
 type VerificationRequest struct {
-	Verification string `json:"verification"`
+	Status       string  `json:"status"`
+	Verification string  `json:"verification"` // legacy alias for status
+	Note         *string `json:"note"`
+	Force        bool    `json:"force"`
 }
 
 // ListResponse is the paginated reports envelope.

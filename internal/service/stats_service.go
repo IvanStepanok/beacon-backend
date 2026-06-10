@@ -25,11 +25,15 @@ func (s *StatsService) Overview(ctx context.Context, crisisID string) (*model.St
 	if err != nil {
 		return nil, err
 	}
-	areas, err := s.reports.AreaGroups(ctx, crisisID)
+	// All-statuses area counts: /stats/overview is analyst-gated (requireAnalyst),
+	// and its aggregate numbers deliberately cover every report (the handler
+	// coarsens only the embedded Recent[] for the viewer tier). The PUBLIC
+	// /reports/area-groups endpoint passes verifiedOnly=true for the anon tier.
+	areas, err := s.reports.AreaGroups(ctx, crisisID, false)
 	if err != nil {
 		return nil, err
 	}
-	series, err := s.reports.TimeSeries(ctx, crisisID)
+	series, seriesUnit, err := s.reports.TimeSeries(ctx, crisisID)
 	if err != nil {
 		return nil, err
 	}
@@ -60,6 +64,7 @@ func (s *StatsService) Overview(ctx context.Context, crisisID string) (*model.St
 		LifeSafetyOpen:     lifeSafetyOpen,
 		Areas:              areas,
 		TimeSeries:         series,
+		TimeSeriesUnit:     seriesUnit,
 		Recent:             recent,
 	}, nil
 }

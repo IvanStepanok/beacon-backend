@@ -7,7 +7,7 @@ import (
 	"github.com/stepanok/beacon-server/internal/store"
 )
 
-// GET /api/v1/reports/export?format=geojson|csv|gpkg|kml|pdna
+// GET /api/v1/reports/export?format=geojson|csv|gpkg|kml
 //
 // Bulk export carries exact coordinates + the full per-report row (incl. building
 // ids and operational columns), so it is restricted to the REAL analyst roles
@@ -49,20 +49,6 @@ func (h *Handlers) ExportReports(w http.ResponseWriter, r *http.Request) {
 		BBox:         bbox,
 	}
 
-	// PDNA pivot is a separate aggregate query (sector × admin), not the row export.
-	if format == "pdna" {
-		rows, err := h.d.Reports.PdnaPivot(r.Context(), f.CrisisID)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "internal", "pivot failed")
-			return
-		}
-		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-		w.Header().Set("Content-Disposition", `attachment; filename="beacon-pdna-damage-by-sector.csv"`)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(service.ToPdnaCSV(rows))
-		return
-	}
-
 	reports, err := h.d.Reports.ExportRows(r.Context(), f)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "internal", "export query failed")
@@ -101,6 +87,6 @@ func (h *Handlers) ExportReports(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(service.ToKML(reports))
 	default:
-		writeErr(w, http.StatusBadRequest, "bad_format", "format must be geojson|csv|gpkg|kml|pdna")
+		writeErr(w, http.StatusBadRequest, "bad_format", "format must be geojson|csv|gpkg|kml")
 	}
 }

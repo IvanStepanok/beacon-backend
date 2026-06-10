@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver (no CGO) for GeoPackage export
 
@@ -20,10 +22,7 @@ import (
 
 // Export produces interoperable formats so Beacon data drops straight into the
 // humanitarian stack: GeoJSON + HXL-tagged CSV (with admin_shapeid columns) +
-// GeoPackage (OGC, single offline file) + KML + a PDNA-ready damage-count aggregate
-// (sector × admin pivot of report COUNTS by damage grade). NOTE: this is a
-// damage-count input for a PDNA, NOT a loss/cost estimation — it carries no monetary
-// or replacement-value figures.
+// GeoPackage (OGC, single offline file) + KML.
 //
 // The exported admin columns are admin_shapeid (geoBoundaries shapeID / illustrative
 // seed codes) — NOT official OCHA P-codes until a source=cod layer exists. They are
@@ -34,29 +33,14 @@ import (
 // decimal degrees (or null when the report's location is unresolved), and properties
 // carry the required gate fields: damage_classification ∈ {Minimal,Partial,Complete},
 // infrastructure_type, timestamp (ISO-8601), hazard_type, and the secondary-impact
-// fields electricity / health_services / pressing_needs from the modular blob.
-
-type exportProps struct {
-	ID                   string `json:"id"`
-	DamageClassification string `json:"damage_classification"` // 3-tier gate value: Minimal|Partial|Complete
-	Damage               string `json:"damage"`                // raw grade kept as a useful extra
-	PossiblyDamaged      bool   `json:"possiblyDamaged"`
-	InfrastructureType   string `json:"infrastructure_type"`
-	HazardType           string `json:"hazard_type"`
-	Timestamp            string `json:"timestamp"` // ISO-8601 of capturedAt
-	Electricity          string `json:"electricity"`
-	HealthServices       string `json:"health_services"`
-	PressingNeeds        string `json:"pressing_needs"`
-	Debris               string `json:"debris"`
-	BuildingID           string `json:"buildingId"`
-	Verification         string `json:"verification"`
-	Synced               bool   `json:"synced"`
-	Place                string `json:"place"`
-	AccuracyMeters       string `json:"accuracy_m,omitempty"`
-	Admin1ShapeID        string `json:"admin1_shapeid,omitempty"`
-	Admin2ShapeID        string `json:"admin2_shapeid,omitempty"`
-	Admin3ShapeID        string `json:"admin3_shapeid,omitempty"`
-}
+// sections flattened from the modular blob — the three known sections under their
+// stable names (electricity / health_services / pressing_needs, always present) plus
+// any later-added section DYNAMICALLY (camelCase key → snake_case), so new modular
+// questions appear in exports without a code change. Rows also carry
+// infrastructure_name, the free-text description (analyst language) and plus_code.
+// These exports are analyst-only: the low-trust external_viewer tier is denied the
+// whole endpoint (403, see handler.ExportReports), so description/precision never
+// reach it.
 
 type exportGeometry struct {
 	Type        string     `json:"type"`
@@ -67,8 +51,10 @@ type exportFeature struct {
 	Type string `json:"type"`
 	// Geometry is a POINTER so an unresolved report serializes "geometry": null
 	// (a Point [lng, lat] otherwise). Never emit [0,0] (Null Island).
+	// Properties is a map (keys marshal sorted) so dynamically-flattened modular
+	// sections ride along with the fixed gate fields.
 	Geometry   *exportGeometry `json:"geometry"`
-	Properties exportProps     `json:"properties"`
+	Properties map[string]any  `json:"properties"`
 }
 
 type exportFC struct {
@@ -94,21 +80,135 @@ func numPtr(f *float64) string {
 	return strconv.FormatFloat(*f, 'g', -1, 64)
 }
 
-// modularImpacts mirrors the [C1] modular wire/stored shape (camelCase keys). The
-// EXPORT column/property names are snake_case (electricity / health_services /
-// pressing_needs) — see flatten in ToGeoJSON / ToCSV.
-type modularImpacts struct {
-	Electricity    *string  `json:"electricity"`
-	HealthServices *string  `json:"healthServices"`
-	PressingNeeds  []string `json:"pressingNeeds"`
+// stableModularColumns are the three known [C1] sections, ALWAYS present in every
+// export row under today's stable snake_case names — even when unanswered (empty).
+var stableModularColumns = []string{"electricity", "health_services", "pressing_needs"}
+
+// safeColumnRe gates DYNAMIC modular keys: only snake_case identifiers become
+// export columns. This keeps CSV headers clean and — critically — makes the
+// client-controlled modular keys safe to splice into the GPKG DDL.
+var safeColumnRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+// reservedExportColumns are container-owned column names a CLIENT-CONTROLLED
+// modular key must never claim: "fid" and "geom" are the GPKG feature table's own
+// primary-key and geometry columns, so a modular section sanitizing to either would
+// duplicate them in the CREATE TABLE and break the WHOLE GPKG export (a one-report
+// DoS on the endpoint). Such keys keep their data under an "x_" prefix instead —
+// applied inside flattenModular, so every format (CSV/GeoJSON/KML/GPKG) renames
+// them consistently. (Keys colliding with the FIXED export columns are already
+// skipped per-format by extraModularColumns; the fixed value always wins.)
+var reservedExportColumns = map[string]bool{"fid": true, "geom": true}
+
+// flattenModular projects the modular blob into snake_case export fields. The three
+// known sections keep their stable names and are ALWAYS present (empty when
+// unanswered); any other section a crisis adds later is flattened automatically
+// (camelCase key → snake_case, arrays ";"-joined), so new modular questions appear
+// in exports without a code change. Keys that don't sanitize to a safe column name
+// are dropped; reserved physical column names (fid/geom) are kept under "x_".
+func flattenModular(raw json.RawMessage) map[string]string {
+	out := map[string]string{}
+	for _, c := range stableModularColumns {
+		out[c] = ""
+	}
+	if len(raw) == 0 || string(raw) == "null" {
+		return out
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil {
+		return out
+	}
+	for k, v := range m {
+		col := camelToSnake(k)
+		if !safeColumnRe.MatchString(col) {
+			continue
+		}
+		if reservedExportColumns[col] {
+			col = "x_" + col
+		}
+		out[col] = flatValue(v)
+	}
+	return out
 }
 
-func parseModular(raw json.RawMessage) modularImpacts {
-	var m modularImpacts
-	if len(raw) > 0 && string(raw) != "null" {
-		_ = json.Unmarshal(raw, &m)
+// flatValue renders one modular answer as a flat cell: strings as-is, arrays
+// ";"-joined, scalars printed, nested objects as compact JSON, null as "".
+func flatValue(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case []any:
+		parts := make([]string, 0, len(t))
+		for _, e := range t {
+			parts = append(parts, flatValue(e))
+		}
+		return strings.Join(parts, ";")
+	case float64:
+		return strconv.FormatFloat(t, 'g', -1, 64)
+	case bool:
+		return strconv.FormatBool(t)
+	default:
+		b, _ := json.Marshal(t)
+		return string(b)
 	}
-	return m
+}
+
+// camelToSnake converts a camelCase modular key to its snake_case export name
+// (healthServices → health_services, pressingNeedsOther → pressing_needs_other).
+func camelToSnake(s string) string {
+	var b strings.Builder
+	for i, r := range s {
+		if unicode.IsUpper(r) {
+			if i > 0 {
+				b.WriteByte('_')
+			}
+			b.WriteRune(unicode.ToLower(r))
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// extraModularColumns returns the sorted DYNAMIC modular columns present across the
+// rows — every flattened key beyond the three stable sections — skipping any key
+// that would collide with a fixed export column.
+func extraModularColumns(reports []model.Report, fixed []string) []string {
+	taken := map[string]bool{}
+	for _, c := range fixed {
+		taken[c] = true
+	}
+	for _, c := range stableModularColumns {
+		taken[c] = true
+	}
+	seen := map[string]bool{}
+	for _, r := range reports {
+		for k := range flattenModular(r.Modular) {
+			if !taken[k] && !seen[k] {
+				seen[k] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// exportDescription is the free-text note in the analysts' common language: the
+// stored translation when one exists, else the original. "" when the report has
+// none. (Analyst-only — external_viewer never reaches the export path.)
+func exportDescription(r model.Report) string {
+	if r.Description == nil {
+		return ""
+	}
+	if r.Description.Translated != "" {
+		return r.Description.Translated
+	}
+	return r.Description.Original
 }
 
 // titleTier title-cases the already-computed 3-tier damage_tier (minimal|partial|
@@ -142,31 +242,44 @@ func ToGeoJSON(reports []model.Report) ([]byte, error) {
 		if reportResolved(r) {
 			geom = &exportGeometry{Type: "Point", Coordinates: [2]float64{*r.Lng, *r.Lat}}
 		}
-		mi := parseModular(r.Modular)
+		// Flattened modular sections first; the fixed gate fields win on any
+		// same-named key.
+		props := map[string]any{}
+		for k, v := range flattenModular(r.Modular) {
+			props[k] = v
+		}
+		props["id"] = r.ID
+		props["damage_classification"] = titleTier(r.DamageTier)
+		props["damage"] = r.Damage // raw grade kept as a useful extra
+		props["possiblyDamaged"] = r.PossiblyDamaged
+		props["infrastructure_type"] = strings.Join(r.InfraTypes, ";")
+		props["infrastructure_name"] = deref(r.InfraName)
+		props["infrastructure_other_detail"] = deref(r.InfraOtherDetail)
+		props["hazard_type"] = strings.Join(r.CrisisNature, ";")
+		props["timestamp"] = r.CapturedAt.UTC().Format(time.RFC3339)
+		props["debris"] = r.Debris
+		props["buildingId"] = deref(r.BuildingID)
+		props["verification"] = r.Verification
+		props["synced"] = r.Synced
+		props["place"] = r.Place
+		props["description"] = exportDescription(r)
+		props["plus_code"] = deref(r.PlusCode)
+		if v := numPtr(r.GPSAccuracyMeters); v != "" {
+			props["accuracy_m"] = v
+		}
+		if v := deref(r.Adm1Pcode); v != "" {
+			props["admin1_shapeid"] = v
+		}
+		if v := deref(r.Adm2Pcode); v != "" {
+			props["admin2_shapeid"] = v
+		}
+		if v := deref(r.Adm3Pcode); v != "" {
+			props["admin3_shapeid"] = v
+		}
 		fc.Features = append(fc.Features, exportFeature{
-			Type:     "Feature",
-			Geometry: geom,
-			Properties: exportProps{
-				ID:                   r.ID,
-				DamageClassification: titleTier(r.DamageTier),
-				Damage:               r.Damage,
-				PossiblyDamaged:      r.PossiblyDamaged,
-				InfrastructureType:   strings.Join(r.InfraTypes, ";"),
-				HazardType:           strings.Join(r.CrisisNature, ";"),
-				Timestamp:            r.CapturedAt.UTC().Format(time.RFC3339),
-				Electricity:          deref(mi.Electricity),
-				HealthServices:       deref(mi.HealthServices),
-				PressingNeeds:        strings.Join(mi.PressingNeeds, ";"),
-				Debris:               r.Debris,
-				BuildingID:           deref(r.BuildingID),
-				Verification:         r.Verification,
-				Synced:               r.Synced,
-				Place:                r.Place,
-				AccuracyMeters:       numPtr(r.GPSAccuracyMeters),
-				Admin1ShapeID:        deref(r.Adm1Pcode),
-				Admin2ShapeID:        deref(r.Adm2Pcode),
-				Admin3ShapeID:        deref(r.Adm3Pcode),
-			},
+			Type:       "Feature",
+			Geometry:   geom,
+			Properties: props,
 		})
 	}
 	// Match JS JSON.stringify: do NOT HTML-escape &, <, > so server and browser
@@ -194,72 +307,49 @@ func csvCell(s string) string {
 // OCHA tooling can machine-merge the file. The admin columns are admin_shapeid
 // columns (geoBoundaries shapeID / illustrative seed codes — NOT official OCHA
 // P-codes until a source=cod layer exists); their HXL tags use +id (not +code) so the
-// file never falsely asserts a P-code provenance.
+// file never falsely asserts a P-code provenance. Any DYNAMIC modular sections beyond
+// the three stable ones are appended after these fixed columns (#indicator+<name>).
 var (
-	csvColumns = []string{"id", "latitude", "longitude", "timestamp", "damage_classification", "damage", "infrastructure_type", "hazard_type", "electricity", "health_services", "pressing_needs", "possiblyDamaged", "debris", "buildingId", "verification", "place", "accuracy_m", "admin1_shapeid", "admin2_shapeid", "admin3_shapeid"}
-	hxlRow     = []string{"#meta+id", "#geo+lat", "#geo+lon", "#date", "#severity+grade", "#severity+raw", "#sector", "#cause", "#indicator+electricity", "#indicator+health", "#indicator+needs", "#indicator+possibly", "#indicator+debris", "#loc+building+id", "#status+verification", "#loc+name", "#indicator+accuracy", "#loc+adm1+id", "#loc+adm2+id", "#loc+adm3+id"}
+	csvColumns = []string{"id", "latitude", "longitude", "timestamp", "damage_classification", "damage", "infrastructure_type", "infrastructure_name", "infrastructure_other_detail", "hazard_type", "electricity", "health_services", "pressing_needs", "possiblyDamaged", "debris", "buildingId", "verification", "place", "description", "plus_code", "accuracy_m", "admin1_shapeid", "admin2_shapeid", "admin3_shapeid"}
+	hxlRow     = []string{"#meta+id", "#geo+lat", "#geo+lon", "#date", "#severity+grade", "#severity+raw", "#sector", "#loc+name+infrastructure", "#loc+name+infrastructure+detail", "#cause", "#indicator+electricity", "#indicator+health", "#indicator+needs", "#indicator+possibly", "#indicator+debris", "#loc+building+id", "#status+verification", "#loc+name", "#description", "#geo+code+plus", "#indicator+accuracy", "#loc+adm1+id", "#loc+adm2+id", "#loc+adm3+id"}
 )
 
 func ToCSV(reports []model.Report) []byte {
+	extras := extraModularColumns(reports, csvColumns)
+	header := append(append([]string{}, csvColumns...), extras...)
+	hxl := append([]string{}, hxlRow...)
+	for _, c := range extras {
+		hxl = append(hxl, "#indicator+"+c)
+	}
+
 	var b bytes.Buffer
-	b.WriteString(strings.Join(csvColumns, ","))
+	b.WriteString(strings.Join(header, ","))
 	b.WriteString("\n")
-	b.WriteString(strings.Join(hxlRow, ",")) // HXL hashtag row
+	b.WriteString(strings.Join(hxl, ",")) // HXL hashtag row
 	for _, r := range reports {
 		// Blank lat/lng for a location-unresolved report (never 0,0).
 		latStr, lngStr := "", ""
 		if reportResolved(r) {
 			latStr, lngStr = numPtr(r.Lat), numPtr(r.Lng)
 		}
-		mi := parseModular(r.Modular)
+		flat := flattenModular(r.Modular)
 		row := []string{
 			r.ID, latStr, lngStr, r.CapturedAt.UTC().Format(time.RFC3339),
 			titleTier(r.DamageTier), r.Damage,
-			strings.Join(r.InfraTypes, ";"), strings.Join(r.CrisisNature, ";"),
-			deref(mi.Electricity), deref(mi.HealthServices), strings.Join(mi.PressingNeeds, ";"),
+			strings.Join(r.InfraTypes, ";"), deref(r.InfraName), deref(r.InfraOtherDetail), strings.Join(r.CrisisNature, ";"),
+			flat["electricity"], flat["health_services"], flat["pressing_needs"],
 			strconv.FormatBool(r.PossiblyDamaged), r.Debris, deref(r.BuildingID),
-			r.Verification, r.Place, numPtr(r.GPSAccuracyMeters),
+			r.Verification, r.Place, exportDescription(r), deref(r.PlusCode), numPtr(r.GPSAccuracyMeters),
 			deref(r.Adm1Pcode), deref(r.Adm2Pcode), deref(r.Adm3Pcode),
+		}
+		for _, c := range extras {
+			row = append(row, flat[c])
 		}
 		for i := range row {
 			row[i] = csvCell(row[i])
 		}
 		b.WriteString("\n")
 		b.WriteString(strings.Join(row, ","))
-	}
-	return b.Bytes()
-}
-
-// ToPdnaCSV renders PDNA-ready damage-count aggregates: a sector × admin pivot of
-// report COUNTS per damage grade, HXL-tagged. This is a damage-count input for a
-// PDNA — NOT a loss/cost estimation (no monetary or replacement-value figures). A
-// leading comment line states this so the file is not mistaken for a costed table.
-func ToPdnaCSV(rows []model.PdnaRow) []byte {
-	// The CANONICAL breakdown is the 3-tier rollup (minimal/partial/complete) which
-	// sums to total per row regardless of capture scale. The 5-level EMS-98 columns
-	// are kept as trailing detail (populated only for ems98-scale reports).
-	// admin2_shapeid (NOT adm2Pcode): the ADM2 codes here are illustrative seed /
-	// geoBoundaries shapeIDs, not official OCHA P-codes — so the column + HXL must not
-	// assert a P-code provenance (#loc+adm2+id, not #adm2+code). See package doc.
-	cols := []string{"admin2_shapeid", "adm2Name", "sector", "minimal", "partial", "complete", "none", "slight", "moderate", "severe", "destroyed", "total"}
-	hxl := []string{"#loc+adm2+id", "#adm2+name", "#sector", "#affected+minimal", "#affected+partial", "#affected+complete", "#affected+none", "#affected+slight", "#affected+moderate", "#affected+severe", "#affected+destroyed", "#affected+total"}
-	var b bytes.Buffer
-	// Honest label: damage-count aggregates, not a loss/cost estimate. '#'-prefixed
-	// so HXL/CSV tooling treats it as a comment line, not data.
-	b.WriteString("# PDNA-ready damage-count aggregates (report counts by damage grade) — NOT a loss/cost estimation\n")
-	b.WriteString("# minimal/partial/complete = canonical 3-tier rollup (sums to total); none..destroyed = EMS-98 detail (ems98-scale only)\n")
-	b.WriteString(strings.Join(cols, ","))
-	b.WriteString("\n")
-	b.WriteString(strings.Join(hxl, ","))
-	for _, r := range rows {
-		cells := []string{
-			csvCell(r.AdmPcode), csvCell(r.AdmName), csvCell(r.Sector),
-			strconv.Itoa(r.Minimal), strconv.Itoa(r.Partial), strconv.Itoa(r.Complete),
-			strconv.Itoa(r.None), strconv.Itoa(r.Slight), strconv.Itoa(r.Moderate),
-			strconv.Itoa(r.Severe), strconv.Itoa(r.Destroyed), strconv.Itoa(r.Total),
-		}
-		b.WriteString("\n")
-		b.WriteString(strings.Join(cells, ","))
 	}
 	return b.Bytes()
 }
@@ -310,6 +400,25 @@ func ToGPKG(reports []model.Report) ([]byte, error) {
 		minX, minY, maxX, maxY = 0, 0, 0, 0
 	}
 
+	// Attribute columns beyond geom: the fixed row schema, then the three stable
+	// modular sections, then any DYNAMIC modular extras (sanitized by
+	// extraModularColumns, so they are safe to splice into the DDL).
+	attrCols := []string{"id", "damage", "possibly_damaged", "verification", "infrastructure", "infrastructure_name", "infrastructure_other_detail", "crisis", "debris", "building_id", "place", "description", "plus_code", "admin2_shapeid", "admin3_shapeid", "captured_at"}
+	attrCols = append(attrCols, stableModularColumns...)
+	extras := extraModularColumns(reports, attrCols)
+	attrCols = append(attrCols, extras...)
+	ddlCols := make([]string, 0, len(attrCols))
+	marks := make([]string, 0, len(attrCols)+1)
+	marks = append(marks, "?") // geom
+	for _, c := range attrCols {
+		t := "TEXT"
+		if c == "possibly_damaged" {
+			t = "INTEGER"
+		}
+		ddlCols = append(ddlCols, c+" "+t)
+		marks = append(marks, "?")
+	}
+
 	stmts := []string{
 		`PRAGMA application_id = 1196444487`, // 'GPKG'
 		`PRAGMA user_version = 10300`,        // GeoPackage 1.3
@@ -317,7 +426,7 @@ func ToGPKG(reports []model.Report) ([]byte, error) {
 		`CREATE TABLE gpkg_contents (table_name TEXT NOT NULL PRIMARY KEY, data_type TEXT NOT NULL, identifier TEXT UNIQUE, description TEXT DEFAULT '', last_change DATETIME NOT NULL, min_x DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE, srs_id INTEGER)`,
 		`CREATE TABLE gpkg_geometry_columns (table_name TEXT NOT NULL, column_name TEXT NOT NULL, geometry_type_name TEXT NOT NULL, srs_id INTEGER NOT NULL, z TINYINT NOT NULL, m TINYINT NOT NULL, PRIMARY KEY (table_name, column_name))`,
 		// admin*_shapeid (NOT adm*_pcode): same provenance caveat as GeoJSON/CSV — see package doc.
-		`CREATE TABLE reports (fid INTEGER PRIMARY KEY AUTOINCREMENT, geom BLOB, id TEXT, damage TEXT, possibly_damaged INTEGER, verification TEXT, infrastructure TEXT, crisis TEXT, debris TEXT, building_id TEXT, place TEXT, admin2_shapeid TEXT, admin3_shapeid TEXT, captured_at TEXT)`,
+		`CREATE TABLE reports (fid INTEGER PRIMARY KEY AUTOINCREMENT, geom BLOB, ` + strings.Join(ddlCols, ", ") + `)`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
@@ -346,7 +455,7 @@ func ToGPKG(reports []model.Report) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	ins, err := tx.Prepare(`INSERT INTO reports (geom, id, damage, possibly_damaged, verification, infrastructure, crisis, debris, building_id, place, admin2_shapeid, admin3_shapeid, captured_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	ins, err := tx.Prepare(`INSERT INTO reports (geom, ` + strings.Join(attrCols, ", ") + `) VALUES (` + strings.Join(marks, ",") + `)`)
 	if err != nil {
 		tx.Rollback()
 		return nil, err
@@ -361,10 +470,20 @@ func ToGPKG(reports []model.Report) ([]byte, error) {
 		if reportResolved(r) {
 			geomBlob = gpbPoint(*r.Lng, *r.Lat)
 		}
-		if _, err := ins.Exec(geomBlob, r.ID, r.Damage, pd, r.Verification,
-			strings.Join(r.InfraTypes, ";"), strings.Join(r.CrisisNature, ";"), r.Debris,
-			deref(r.BuildingID), r.Place, deref(r.Adm2Pcode), deref(r.Adm3Pcode),
-			r.CapturedAt.UTC().Format(time.RFC3339)); err != nil {
+		flat := flattenModular(r.Modular)
+		args := []any{geomBlob, r.ID, r.Damage, pd, r.Verification,
+			strings.Join(r.InfraTypes, ";"), deref(r.InfraName), deref(r.InfraOtherDetail),
+			strings.Join(r.CrisisNature, ";"), r.Debris,
+			deref(r.BuildingID), r.Place, exportDescription(r), deref(r.PlusCode),
+			deref(r.Adm2Pcode), deref(r.Adm3Pcode),
+			r.CapturedAt.UTC().Format(time.RFC3339)}
+		for _, c := range stableModularColumns {
+			args = append(args, flat[c])
+		}
+		for _, c := range extras {
+			args = append(args, flat[c])
+		}
+		if _, err := ins.Exec(args...); err != nil {
 			ins.Close()
 			tx.Rollback()
 			return nil, err
@@ -401,11 +520,22 @@ func ToKML(reports []model.Report) []byte {
 		if !reportResolved(r) {
 			continue
 		}
-		mi := parseModular(r.Modular)
+		// Modular sections (stable three + dynamic extras) in sorted key order.
+		flat := flattenModular(r.Modular)
+		keys := make([]string, 0, len(flat))
+		for k := range flat {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var impacts strings.Builder
+		for _, k := range keys {
+			impacts.WriteString(fmt.Sprintf("%s: %s\n", k, flat[k]))
+		}
 		desc := fmt.Sprintf(
-			"damage_classification: %s\ninfrastructure_type: %s\nhazard_type: %s\nelectricity: %s\nhealth_services: %s\npressing_needs: %s\nverification: %s\ntimestamp: %s",
-			titleTier(r.DamageTier), strings.Join(r.InfraTypes, ";"), strings.Join(r.CrisisNature, ";"),
-			deref(mi.Electricity), deref(mi.HealthServices), strings.Join(mi.PressingNeeds, ";"),
+			"damage_classification: %s\ninfrastructure_type: %s\ninfrastructure_name: %s\ninfrastructure_other_detail: %s\nhazard_type: %s\n%sdescription: %s\nplus_code: %s\nverification: %s\ntimestamp: %s",
+			titleTier(r.DamageTier), strings.Join(r.InfraTypes, ";"), deref(r.InfraName), deref(r.InfraOtherDetail),
+			strings.Join(r.CrisisNature, ";"), impacts.String(),
+			exportDescription(r), deref(r.PlusCode),
 			r.Verification, r.CapturedAt.UTC().Format(time.RFC3339))
 		b.WriteString("<Placemark>")
 		b.WriteString("<name>" + xmlEscape(r.ID) + "</name>")

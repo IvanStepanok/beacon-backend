@@ -12,9 +12,11 @@ info:
       `external_viewer` role see **verified reports only**, in a locked-down
       *public projection*: coordinates coarsened to 3 decimal places (~110 m),
       and `submitterId`, `what3words`, `plusCode`, `landmark`, `buildingId`,
-      `gpsAccuracyMeters`, `description`, tasking/operational fields, `modular`
-      and `anonymization` are stripped. Unverified reports return 404 so their
-      existence and position are never leaked.
+      `buildingSource`, `infraName`, `gpsAccuracyMeters`, `description`,
+      tasking/operational fields, `modular` and `anonymization` are stripped.
+      Unverified reports return 404 so their existence and position are never
+      leaked. Public aggregates (`/reports/area-groups`) count verified
+      reports only for this tier, coherent with the verified-only public map.
     - **Analyst roles** (`field_validator`, `co_analyst`, `regional_analyst`,
       `crisis_admin`) see all statuses at full precision, limited to the
       crises in their `crisisScope` (`"*"` = org-wide).
@@ -43,7 +45,9 @@ info:
     `/reports/area-groups`, `/reports/latest-per-building`, `/config`,
     `/crises/{id}/danger-zones`, `/crises/{id}/status`, `/feeds/refresh`,
     `/profile` — exist in `internal/api/router.go` but are not yet documented
-    here.
+    here. `POST /v1/profile/points` is intentionally undocumented as an API:
+    it is the RETIRED self-award endpoint and always answers **410 Gone**
+    (points/badges are server-derived from verified reports, anti-gaming).
 servers:
   - url: /api
     description: All routes below are mounted under /api (e.g. POST /api/v1/reports).
@@ -61,6 +65,8 @@ tags:
     description: Aggregated crisis statistics.
   - name: crises
     description: Crisis events (active, nearby, by id).
+  - name: forms
+    description: Modular capture-form schema (Appendix-1 sections, adjustable per crisis).
   - name: buildings
     description: Per-building damage history.
 
@@ -145,16 +151,28 @@ paths:
         **Crisis assignment:** an explicit `crisisId` pins the report; empty
         or `"auto"` lets the server assign by space+time. With no match the
         report stays pending (empty `crisisId`) and may seed an emergent
-        crisis proposal.
+        crisis proposal. **Geographic containment:** a pinned crisis is
+        IGNORED (not rejected) when the report's resolved point lies more than
+        max(radiusKm×1.5, radiusKm+5) km from that crisis's center — the
+        normal spatial assignment runs instead. Landmark-only (no-coords)
+        reports always keep their pin.
+
+        **Hazard:** an empty `crisisNature` stays empty — the server never
+        fabricates a default hazard.
 
         **Anti-abuse:** per submitter, at most 5 reports/minute and
-        20 reports/10 minutes (429 `rate_limited`); a building-less pin within
-        25 m and 10 min of the same submitter's previous pin is rejected with
-        409 `duplicate` referencing the existing report id.
+        20 reports/10 minutes (429 `rate_limited`); a pin within 25 m and
+        10 min of the same submitter's previous pin is rejected with 409
+        `duplicate` referencing the existing report id. Only a real tapped
+        footprint (`buildingSource: "footprint"`, or a legacy `fp-`-prefixed
+        `buildingId`) is exempt — its re-reports merge via the per-building
+        version chain; synthetic GPS-grid `b-` building ids are checked like
+        building-less pins.
 
         **Modular secondary impacts** (`modular`): the server stores the blob
         verbatim; the documented wire enums are in the `ModularImpacts`
-        schema (electricity, healthServices, pressingNeeds).
+        schema (electricity, healthServices, pressingNeeds — incl.
+        `basic_services` and the free-text `pressingNeedsOther`).
       parameters:
         - $ref: '#/components/parameters/DeviceIdRequired'
       requestBody:
@@ -319,13 +337,18 @@ paths:
         **Row formats (geojson / csv / gpkg / kml)** carry the gate field
         list: `damage_classification` ∈ {Minimal, Partial, Complete} (the
         canonical 3-tier rollup), raw `damage` grade, `infrastructure_type`,
-        `hazard_type`, `timestamp` (ISO-8601 of capturedAt, UTC), and the
-        secondary-impact fields `electricity`, `health_services`,
-        `pressing_needs` (flattened from the modular blob), plus
-        `possiblyDamaged`, `debris`, `buildingId`, `verification`, `place`,
-        `accuracy_m`, and the `admin1_shapeid` / `admin2_shapeid` /
-        `admin3_shapeid` columns (geoBoundaries shapeIDs / seed codes — NOT
-        OCHA P-codes; their HXL tags use `+id`, never `+code`).
+        `infrastructure_name`, `hazard_type` (empty when the reporter asserted
+        none), `timestamp` (ISO-8601 of capturedAt, UTC), and the modular
+        secondary-impact sections flattened to snake_case — the three known
+        sections under their stable names (`electricity`, `health_services`,
+        `pressing_needs`, always present) plus any later-added section
+        DYNAMICALLY (e.g. `pressingNeedsOther` → `pressing_needs_other`,
+        appended after the fixed CSV columns) — plus `possiblyDamaged`,
+        `debris`, `buildingId`, `verification`, `place`, `description`
+        (free-text note, analyst language), `plus_code`, `accuracy_m`, and
+        the `admin1_shapeid` / `admin2_shapeid` / `admin3_shapeid` columns
+        (geoBoundaries shapeIDs / seed codes — NOT OCHA P-codes; their HXL
+        tags use `+id`, never `+code`).
 
         - `geojson` — FeatureCollection; geometry is a Point `[lng, lat]` in
           decimal degrees, or `null` for a location-unresolved report (never
@@ -417,9 +440,10 @@ paths:
         - **Anonymous** (and the authenticated `external_viewer`): only a
           VERIFIED report is returned, in the public projection — coordinates
           coarsened to 3 decimals (~110 m); `submitterId`, `what3words`,
-          `plusCode`, `landmark`, `buildingId`, `gpsAccuracyMeters`,
-          `description`, tasking fields, `modular` and `anonymization`
-          stripped. An unverified report 404s (its existence is never leaked).
+          `plusCode`, `landmark`, `buildingId`, `buildingSource`, `infraName`,
+          `gpsAccuracyMeters`, `description`, tasking fields, `modular` and
+          `anonymization` stripped. An unverified report 404s (its existence
+          is never leaked).
         - **Analyst roles** in scope for the report's crisis get the full
           document at full precision (any verification status). An
           out-of-scope report 404s rather than 403s.
@@ -529,6 +553,14 @@ paths:
         `external_viewer` (403 `forbidden`), crisis-scoped: an analyst may
         only verify reports of crises in their scope (403 `out_of_scope`); a
         pending report with no crisis is mutable only with org-wide scope.
+
+        **Photo gate:** setting `status: verified` on a report with NO photo
+        is rejected with 409 `photo_required` unless `force: true` is passed.
+        "Photo" means evidence actually **uploaded to the server** (a stored
+        image, served by `GET /v1/reports/{id}/photo`) — photo metadata merely
+        claimed by the client in the submit body does not count. The optional
+        `note` and the `force` flag are recorded in the verification audit
+        trail.
       security:
         - bearerAuth: []
       parameters:
@@ -554,6 +586,15 @@ paths:
           $ref: '#/components/responses/OutOfScope'
         "404":
           $ref: '#/components/responses/NotFound'
+        "409":
+          description: |-
+            Verifying a photo-less report without `force=true`
+            (`photo_required`). "Photo-less" = no evidence uploaded to the
+            server; client-claimed photo metadata does not satisfy the gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /v1/reports/{id}/task:
     patch:
@@ -738,6 +779,95 @@ paths:
         "404":
           $ref: '#/components/responses/NotFound'
 
+  /v1/crises/{id}/form:
+    patch:
+      tags: [forms]
+      operationId: patchCrisisForm
+      summary: Adjust a crisis's modular capture form (senior analysts)
+      description: |-
+        Stores per-crisis overrides over the default Appendix-1 sections:
+        section keys in `required` are flipped to required, keys in `disabled`
+        are removed from the form entirely. Keys must name known sections
+        (`electricity`, `healthServices`, `pressingNeeds`) and a key cannot be
+        in both lists. Sending two empty lists resets the crisis to the pure
+        defaults.
+
+        **RBAC:** `regional_analyst` / `crisis_admin` only (shaping what every
+        reporter in a crisis is asked is a senior decision, like
+        `/crises/{id}/status`), and the crisis must be inside the caller's
+        `crisisScope`. Other mutator roles get 403 `forbidden`; out-of-scope
+        gets 403 `out_of_scope`.
+
+        Responds with the crisis's RESOLVED schema (same shape as
+        `GET /v1/form-schema`) so a dashboard can re-render immediately.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FormOverrides'
+      responses:
+        "200":
+          description: The crisis's resolved form schema after the update.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FormSchema'
+        "400":
+          description: Malformed JSON (`bad_json`), unknown section key or a key in both lists (`validation`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/OutOfScope'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /v1/form-schema:
+    get:
+      tags: [forms]
+      operationId: getFormSchema
+      summary: The modular capture-form schema for a crisis (public)
+      description: |-
+        PUBLIC (like `/v1/crises`): the anonymous mobile capture flow downloads
+        the modular form definition before submitting. Returns the built-in
+        Appendix-1 sections — electricity (6 options), healthServices (5),
+        pressingNeeds (10, multi-select with an "Other → specify" free text) —
+        with the crisis's stored overrides applied: `required` flips a section
+        to required, `disabled` removes it.
+
+        Option `value`s are EXACTLY the wire values the mobile client already
+        stores in the report's `modular` blob (the `ModularImpacts` enums);
+        sections default to optional (the modular framing — the required core
+        indicators are fixed report fields, not these).
+
+        With no `crisisId` the newest active crisis's form is returned (same
+        default scope as the other public reads); an unknown crisis id
+        resolves to the plain defaults rather than an error, so offline-first
+        clients holding a stale id always get a usable form.
+      parameters:
+        - name: crisisId
+          in: query
+          schema: { type: string }
+          description: The crisis whose form to resolve (default = newest active crisis).
+      responses:
+        "200":
+          description: The resolved form sections.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FormSchema'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -878,9 +1008,14 @@ components:
         buildingId:
           type: string
           nullable: true
+        buildingSource:
+          type: string
+          nullable: true
+          description: '"footprint" only when a real footprint polygon was tapped; null otherwise.'
         what3words:
           type: string
           nullable: true
+          description: Legacy misnamed Plus Code alias (same value as plusCode, kept for compat).
         plusCode:
           type: string
           nullable: true
@@ -951,7 +1086,11 @@ components:
           type: array
           items:
             type: string
-            enum: [food_water, cash, healthcare, shelter, livelihoods, wash, protection, local_support, other]
+            enum: [food_water, cash, healthcare, shelter, livelihoods, wash, protection, local_support, basic_services, other]
+        pressingNeedsOther:
+          type: string
+          nullable: true
+          description: Free-text detail for the `other` pressing need ("Other → specify").
 
     SubmitReportRequest:
       type: object
@@ -992,6 +1131,10 @@ components:
           type: array
           items: { type: string }
           description: Dashboard alias for infraTypes (used when infraTypes is empty).
+        infraName:
+          type: string
+          nullable: true
+          description: Name/details of the infrastructure (any type), e.g. "Cumhuriyet Primary School".
         infraOtherDetail:
           type: string
           nullable: true
@@ -1000,7 +1143,7 @@ components:
           items:
             type: string
             enum: [earthquake, flood, tsunami, hurricane, wildfire, explosion, chemical, conflict, civil_unrest]
-          description: Defaults to ["earthquake"] when empty.
+          description: Optional — an empty list stays empty (the server never fabricates a hazard).
         crisis:
           type: array
           items: { type: string }
@@ -1032,12 +1175,19 @@ components:
         buildingId:
           type: string
           nullable: true
+        buildingSource:
+          type: string
+          nullable: true
+          enum: [footprint]
+          description: '"footprint" ONLY when a real footprint polygon was tapped on the map (buildingId is then the stable footprint id); null otherwise — clients never fabricate a building identity.'
         what3words:
           type: string
           nullable: true
+          description: Legacy misnamed Plus Code field; used as a fallback when plusCode is absent.
         plusCode:
           type: string
           nullable: true
+          description: Open Location Code (Plus Code) — the canonical field; preferred over the legacy what3words.
         landmark:
           type: string
           nullable: true
@@ -1047,6 +1197,7 @@ components:
           nullable: true
         place:
           type: string
+          description: The literal client placeholder "Your location" (case-insensitive, trimmed) is sanitized to empty — never stored as a place name.
         description:
           allOf:
             - $ref: '#/components/schemas/ReportDescription'
@@ -1131,6 +1282,10 @@ components:
           type: array
           items: { type: string }
           description: Dashboard alias (same array as infraTypes).
+        infraName:
+          type: string
+          nullable: true
+          description: Name/details of the infrastructure (any type), e.g. "Cumhuriyet Primary School".
         infraOtherDetail:
           type: string
           nullable: true
@@ -1157,12 +1312,18 @@ components:
         buildingId:
           type: string
           nullable: true
+        buildingSource:
+          type: string
+          nullable: true
+          description: '"footprint" when the report was pinned by tapping a real footprint polygon; null otherwise.'
         what3words:
           type: string
           nullable: true
+          description: Legacy misnamed Plus Code alias — emitted with the same value as plusCode for compat.
         plusCode:
           type: string
           nullable: true
+          description: Open Location Code (Plus Code) — the canonical field.
         landmark:
           type: string
           nullable: true
@@ -1276,11 +1437,25 @@ components:
 
     VerificationRequest:
       type: object
-      required: [verification]
+      description: |-
+        One of `status` (canonical) or `verification` (legacy alias) must be
+        supplied; `status` wins when both are present.
       properties:
+        status:
+          type: string
+          enum: [pending, verified, flagged]
         verification:
           type: string
           enum: [pending, verified, flagged]
+          deprecated: true
+          description: Legacy alias of status.
+        note:
+          type: string
+          nullable: true
+          description: Free-text analyst note, recorded in the verification audit trail.
+        force:
+          type: boolean
+          description: Overrides the photo gate — allows status=verified on a report with no photo. Recorded in the audit trail as forced.
 
     TaskRequest:
       type: object
@@ -1363,6 +1538,66 @@ components:
           nullable: true
           description: Only on /crises/near — true if the queried point is within radiusKm.
 
+    FormOption:
+      type: object
+      required: [value, label]
+      properties:
+        value:
+          type: string
+          description: The wire value stored in the report's `modular` blob (matches the `ModularImpacts` enums — never re-invented).
+        label:
+          type: string
+          description: The Appendix-1 display text.
+
+    FormSection:
+      type: object
+      required: [key, title, type, required, options]
+      properties:
+        key:
+          type: string
+          enum: [electricity, healthServices, pressingNeeds]
+          description: The section's key in the report's `modular` blob.
+        title: { type: string }
+        type:
+          type: string
+          enum: [single, multi]
+        required:
+          type: boolean
+          description: Defaults to false (modular framing); flipped per crisis via form overrides.
+        allowOtherText:
+          type: boolean
+          description: Present (true) on multi sections with an "Other → specify" free text (stored as `pressingNeedsOther`).
+        options:
+          type: array
+          items:
+            $ref: '#/components/schemas/FormOption'
+
+    FormSchema:
+      type: object
+      required: [sections]
+      properties:
+        sections:
+          type: array
+          items:
+            $ref: '#/components/schemas/FormSection'
+
+    FormOverrides:
+      type: object
+      description: |-
+        Per-crisis form adjustment (the PATCH /v1/crises/{id}/form body and the
+        stored `crises.form_overrides` document). Keys must name known
+        sections; a key cannot appear in both lists. Omitted lists are treated
+        as empty; two empty lists reset the crisis to the defaults.
+      properties:
+        required:
+          type: array
+          items: { type: string }
+          description: Section keys flipped to required.
+        disabled:
+          type: array
+          items: { type: string }
+          description: Section keys removed from the form entirely.
+
     BuildingVersion:
       type: object
       properties:
@@ -1431,6 +1666,10 @@ components:
 
     TimeBucket:
       type: object
+      description: |-
+        One activity bucket. `hour` is really the bucket index in
+        `timeSeriesUnit` steps ago (0 = now); the key predates the adaptive
+        daily bucketing and is kept for dashboard compatibility.
       properties:
         hour: { type: integer }
         count: { type: integer }
@@ -1481,6 +1720,13 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/TimeBucket'
+        timeSeriesUnit:
+          type: string
+          enum: [hour, day]
+          description: |-
+            Bucket width of `timeSeries`. Adapts to the crisis age so the
+            activity chart stays meaningful long after onset: 12 hourly buckets
+            up to 48h, then daily buckets covering the span (min 7, max 30).
         recent:
           type: array
           items:

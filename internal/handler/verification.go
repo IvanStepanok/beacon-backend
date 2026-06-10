@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/stepanok/beacon-server/internal/model"
+	"github.com/stepanok/beacon-server/internal/store"
 )
 
 // PATCH /api/v1/reports/{id}/verification — analyst decision (auth enforced by router).
@@ -16,8 +18,14 @@ func (h *Handlers) PatchVerification(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_json", err.Error())
 		return
 	}
-	if !containsStr(model.Verifications, req.Verification) {
-		writeErr(w, http.StatusBadRequest, "validation", "verification must be pending|verified|flagged")
+	// `status` is the canonical body key; `verification` is the legacy alias older
+	// dashboards still send (status wins when both are present).
+	status := req.Status
+	if status == "" {
+		status = req.Verification
+	}
+	if !containsStr(model.Verifications, status) {
+		writeErr(w, http.StatusBadRequest, "validation", "status must be pending|verified|flagged")
 		return
 	}
 	// Crisis-scope the mutation: load the report, resolve its crisis, enforce scope.
@@ -36,8 +44,14 @@ func (h *Handlers) PatchVerification(w http.ResponseWriter, r *http.Request) {
 	if u := UserFromContext(r.Context()); u != nil {
 		actor = u.Email
 	}
-	updated, err := h.d.Reports.UpdateVerification(r.Context(), id, req.Verification, actor)
+	updated, err := h.d.Reports.UpdateVerification(r.Context(), id, status, actor, req.Note, req.Force)
 	if err != nil {
+		// Photo gate: verifying a photo-less report needs the explicit force=true
+		// override (which is recorded in the audit trail as forced).
+		if errors.Is(err, store.ErrPhotoRequired) {
+			writeErr(w, http.StatusConflict, "photo_required", "cannot verify a report without a photo; pass force=true to override")
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "internal", "update failed")
 		return
 	}

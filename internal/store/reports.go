@@ -21,8 +21,8 @@ import (
 // at seed time because the seeder sets captured_at = now()-ageMin).
 const reportSelect = `
   id, idempotency_key, COALESCE(crisis_id, '') AS crisis_id, submitter_id::text, damage, possibly_damaged, verification, debris,
-  infra_types, infra_other_detail, crisis_nature, lat, lng, gps_accuracy_m, building_id,
-  version, supersedes_report_id, what3words, plus_code, landmark, place, photo_url,
+  infra_types, infra_other_detail, infra_name, crisis_nature, lat, lng, gps_accuracy_m, building_id, building_source,
+  version, supersedes_report_id, plus_code, landmark, place, photo_url,
   desc_original, desc_original_lang, desc_translated, desc_translated_lang,
   ai_level, ai_confidence, photos, size_bytes, modular, anonymization,
   is_mine, synced, sync_state, captured_at, created_at, updated_at, admin,
@@ -45,8 +45,8 @@ func scanReport(row pgx.Row) (model.Report, error) {
 	)
 	err := row.Scan(
 		&r.ID, &r.IdempotencyKey, &r.CrisisID, &submitterID, &r.Damage, &r.PossiblyDamaged, &r.Verification, &r.Debris,
-		&r.InfraTypes, &r.InfraOtherDetail, &r.CrisisNature, &lat, &lng, &r.GPSAccuracyMeters, &r.BuildingID,
-		&r.Version, &r.SupersedesReportID, &r.What3Words, &r.PlusCode, &r.Landmark, &r.Place, &r.PhotoURL,
+		&r.InfraTypes, &r.InfraOtherDetail, &r.InfraName, &r.CrisisNature, &lat, &lng, &r.GPSAccuracyMeters, &r.BuildingID, &r.BuildingSource,
+		&r.Version, &r.SupersedesReportID, &r.PlusCode, &r.Landmark, &r.Place, &r.PhotoURL,
 		&descOriginal, &descOriginalLang, &descTranslated, &descTranslatedLang,
 		&r.AILevel, &r.AIConfidence, &photosRaw, &r.SizeBytes, &modularRaw, &anonRaw,
 		&r.IsMine, &r.Synced, &syncRaw, &r.CapturedAt, &r.CreatedAt, &r.UpdatedAt, &adminRaw,
@@ -118,13 +118,16 @@ func scanReport(row pgx.Row) (model.Report, error) {
 		r.CrisisNature = []string{}
 	}
 
-	// Derived / alias projections (superset contract).
+	// Derived / alias projections (superset contract). what3words is a legacy ALIAS
+	// of plus_code (the misnamed column was merged away in migration 00014) — both
+	// keys emit the same value so existing mobile builds keep working.
 	r.SizeMb = round1(float64(r.SizeBytes) / 1e6)
 	r.Infra = r.InfraTypes
 	r.Crisis = r.CrisisNature
+	r.What3Words = r.PlusCode
 	r.Location = model.ReportLocation{
-		Lat: r.Lat, Lng: r.Lng, BuildingID: r.BuildingID,
-		What3Words: r.What3Words, PlusCode: r.PlusCode, Landmark: r.Landmark,
+		Lat: r.Lat, Lng: r.Lng, BuildingID: r.BuildingID, BuildingSource: r.BuildingSource,
+		What3Words: r.PlusCode, PlusCode: r.PlusCode, Landmark: r.Landmark,
 		GPSAccuracyMeters: r.GPSAccuracyMeters,
 	}
 	return r, nil
@@ -608,13 +611,20 @@ func (s *Reports) BuildingTimeline(ctx context.Context, buildingID string, verif
 // capture scale) would rank as 0 and a true worst could be missed. The returned
 // `worst` is the raw grade of the worst-tier report; `worstTier` is its rollup tier.
 // A stable tie-break on the raw grade keeps results deterministic across scales.
-func (s *Reports) AreaGroups(ctx context.Context, crisisID string) ([]model.AreaGroup, error) {
+// verifiedOnly restricts the counts to verified reports — the public/anonymous
+// visibility tier — so the public aggregate stays coherent with the verified-only
+// public map/pins (a pending/flagged report is never countable from the anon tier).
+func (s *Reports) AreaGroups(ctx context.Context, crisisID string, verifiedOnly bool) ([]model.AreaGroup, error) {
+	cond := ""
+	if verifiedOnly {
+		cond = " AND verification = 'verified'"
+	}
 	sql := `
 		WITH ranked AS (
 		  SELECT place,
 		         damage, damage_tier,
 		         CASE damage_tier WHEN 'complete' THEN 2 WHEN 'partial' THEN 1 ELSE 0 END AS tier_rank
-		  FROM reports WHERE crisis_id = $1 AND place <> ''
+		  FROM reports WHERE crisis_id = $1 AND place <> ''` + cond + `
 		)
 		SELECT place AS area, count(*) AS cnt,
 		       (ARRAY_AGG(damage      ORDER BY tier_rank DESC, damage DESC))[1] AS worst,
@@ -659,40 +669,34 @@ func (s *Reports) CountRecentBySubmitter(ctx context.Context, submitterID string
 
 // FindDuplicateBySubmitter detects a genuine near-duplicate from the SAME submitter
 // that is NOT just an idempotency replay (same id / idempotency-key is already
-// handled by the UPSERT). A duplicate is either:
+// handled by the UPSERT): another report submitted within dupRadiusMeters and
+// dupWindowSeconds of this one. Candidates exclude FOOTPRINT reports
+// (building_source='footprint', or the legacy "fp-" id prefix) on the prior side:
+// re-reporting a tapped footprint is the per-building version chain's job, never a
+// duplicate. Building-less pins AND synthetic GPS-grid "b-" building ids — which
+// are derived from the pin itself — both count as candidates (the caller applies
+// the same footprint exemption to the INCOMING report, see service.isFootprintReport).
 //
-//	(a) same submitter + same building_id (any time) — they are re-reporting a
-//	    building they already reported; the per-building version chain is the right
-//	    home for that update, not a brand-new near-identical pending row; OR
-//	(b) same submitter submitting again within dupRadiusMeters and dupWindowSeconds
-//	    with NO building id on either side (a building-less pin dropped almost on
-//	    top of a previous one in quick succession).
-//
-// It returns the existing report id (newest match) so the caller can either MERGE
-// (building case → supersede via the version chain) or reject with 409 referencing
-// it. excludeID skips the row currently being inserted. found=false => not a dup.
+// It returns the existing report id (newest match) so the caller can reject with
+// 409 referencing it. excludeID skips the row currently being inserted.
+// found=false => not a dup.
 func (s *Reports) FindDuplicateBySubmitter(
-	ctx context.Context, submitterID string, buildingID *string,
+	ctx context.Context, submitterID string,
 	lat, lng float64, capturedAt time.Time, dupRadiusMeters, dupWindowSeconds float64, excludeID string,
 ) (existingID string, found bool, err error) {
-	if buildingID != nil && *buildingID != "" {
-		// (a) same submitter + same building.
-		err = s.pool.QueryRow(ctx, `
-			SELECT id FROM reports
-			WHERE submitter_id = $1::uuid AND building_id = $2 AND id <> $3
-			ORDER BY captured_at DESC, id DESC LIMIT 1`,
-			submitterID, *buildingID, excludeID).Scan(&existingID)
-	} else {
-		// (b) same submitter, building-less, within radius + time window.
-		pt := "ST_SetSRID(ST_MakePoint($3,$2),4326)::geography"
-		err = s.pool.QueryRow(ctx, `
-			SELECT id FROM reports
-			WHERE submitter_id = $1::uuid AND building_id IS NULL AND id <> $6
-			  AND captured_at >= $4 - make_interval(secs => $5)
-			  AND ST_DWithin(geom::geography, `+pt+`, $7)
-			ORDER BY captured_at DESC, id DESC LIMIT 1`,
-			submitterID, lat, lng, capturedAt, dupWindowSeconds, excludeID, dupRadiusMeters).Scan(&existingID)
-	}
+	pt := "ST_SetSRID(ST_MakePoint($3,$2),4326)::geography"
+	// $4 must be cast explicitly: in `$4 - interval` the server would otherwise
+	// infer $4 itself as interval, and the statement fails to prepare at all
+	// (timestamptz >= interval) — i.e. the guard would 500 every guarded submit.
+	err = s.pool.QueryRow(ctx, `
+		SELECT id FROM reports
+		WHERE submitter_id = $1::uuid AND id <> $6
+		  AND (building_id IS NULL
+		       OR (COALESCE(building_source, '') <> 'footprint' AND building_id NOT LIKE 'fp-%'))
+		  AND captured_at >= $4::timestamptz - make_interval(secs => $5)
+		  AND ST_DWithin(geom::geography, `+pt+`, $7)
+		ORDER BY captured_at DESC, id DESC LIMIT 1`,
+		submitterID, lat, lng, capturedAt, dupWindowSeconds, excludeID, dupRadiusMeters).Scan(&existingID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return "", false, nil
