@@ -96,3 +96,55 @@ func (s *Reports) ExportRows(ctx context.Context, f ListFilter) ([]model.Report,
 	}
 	return scanReports(rows)
 }
+
+// ExportEach streams every report matching a filter to fn, scanning row-by-row
+// over a DB cursor WITHOUT materializing the full result set. This is the export
+// path used at crisis scale (100k–500k): the prior ExportRows-then-build-bytes
+// flow peaked at multi-GB RSS (the whole []Report slice + the whole output buffer
+// in memory) and would OOM a memory-tight host. fn must not retain the *Report
+// past its call. The pooled connection is held for the export's duration, which is
+// expected for a bulk download endpoint.
+func (s *Reports) ExportEach(ctx context.Context, f ListFilter, fn func(*model.Report) error) error {
+	where, args := f.whereClause(1)
+	sql := "SELECT " + reportSelect + " FROM reports " + where + " ORDER BY captured_at DESC, id DESC"
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		r, err := scanReport(rows)
+		if err != nil {
+			return err
+		}
+		if err := fn(&r); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// ModularKeysRaw returns the DISTINCT top-level modular JSON object keys present
+// across the filtered reports — a cheap pre-pass (no row buffering) so the
+// streaming CSV/GPKG writers can fix their dynamic column set before the first
+// row is written. The subquery form keeps it correct whether or not whereClause
+// emitted a WHERE.
+func (s *Reports) ModularKeysRaw(ctx context.Context, f ListFilter) ([]string, error) {
+	where, args := f.whereClause(1)
+	sql := "SELECT DISTINCT jsonb_object_keys(modular) FROM (SELECT modular FROM reports " + where +
+		") q WHERE modular IS NOT NULL AND jsonb_typeof(modular) = 'object'"
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}

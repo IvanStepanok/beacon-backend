@@ -2,20 +2,15 @@ package service
 
 import (
 	"bytes"
-	"database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 	"unicode"
-
-	_ "modernc.org/sqlite" // pure-Go SQLite driver (no CGO) for GeoPackage export
 
 	"github.com/stepanok/beacon-server/internal/model"
 )
@@ -236,64 +231,14 @@ func reportResolved(r model.Report) bool {
 	return r.LocationResolved && r.Lat != nil && r.Lng != nil
 }
 
+// ToGeoJSON is the in-memory wrapper (tests + small callers) over StreamGeoJSON;
+// the export endpoint streams from a DB cursor instead (see handler.ExportReports).
 func ToGeoJSON(reports []model.Report) ([]byte, error) {
-	fc := exportFC{Type: "FeatureCollection", Features: make([]exportFeature, 0, len(reports))}
-	for _, r := range reports {
-		// Geometry is null for a location-unresolved report (never [0,0]).
-		var geom *exportGeometry
-		if reportResolved(r) {
-			geom = &exportGeometry{Type: "Point", Coordinates: [2]float64{*r.Lng, *r.Lat}}
-		}
-		// Flattened modular sections first; the fixed gate fields win on any
-		// same-named key.
-		props := map[string]any{}
-		for k, v := range flattenModular(r.Modular) {
-			props[k] = v
-		}
-		props["id"] = r.ID
-		props["damage_classification"] = titleTier(r.DamageTier)
-		props["damage"] = r.Damage // raw grade kept as a useful extra
-		props["possiblyDamaged"] = r.PossiblyDamaged
-		props["infrastructure_type"] = strings.Join(r.InfraTypes, ";")
-		props["infrastructure_name"] = deref(r.InfraName)
-		props["infrastructure_other_detail"] = deref(r.InfraOtherDetail)
-		props["hazard_type"] = strings.Join(r.CrisisNature, ";")
-		props["timestamp"] = r.CapturedAt.UTC().Format(time.RFC3339)
-		props["debris"] = r.Debris
-		props["buildingId"] = deref(r.BuildingID)
-		props["verification"] = r.Verification
-		props["synced"] = r.Synced
-		props["place"] = r.Place
-		props["description"] = exportDescription(r)
-		props["plus_code"] = deref(r.PlusCode)
-		if v := numPtr(r.GPSAccuracyMeters); v != "" {
-			props["accuracy_m"] = v
-		}
-		if v := deref(r.Adm1Pcode); v != "" {
-			props["admin1_pcode"] = v
-		}
-		if v := deref(r.Adm2Pcode); v != "" {
-			props["admin2_pcode"] = v
-		}
-		if v := deref(r.Adm3Pcode); v != "" {
-			props["admin3_pcode"] = v
-		}
-		fc.Features = append(fc.Features, exportFeature{
-			Type:       "Feature",
-			Geometry:   geom,
-			Properties: props,
-		})
-	}
-	// Match JS JSON.stringify: do NOT HTML-escape &, <, > so server and browser
-	// exports stay byte-interchangeable. Encoder adds a trailing newline — trim it.
 	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(fc); err != nil {
+	if err := StreamGeoJSON(&buf, sliceSource(reports)); err != nil {
 		return nil, err
 	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+	return buf.Bytes(), nil
 }
 
 var csvNeedsQuote = regexp.MustCompile(`[",\n]`)
@@ -317,43 +262,13 @@ var (
 	hxlRow     = []string{"#meta+id", "#geo+lat", "#geo+lon", "#date", "#severity+grade", "#severity+raw", "#sector", "#loc+name+infrastructure", "#loc+name+infrastructure+detail", "#cause", "#indicator+electricity", "#indicator+health", "#indicator+needs", "#indicator+possibly", "#indicator+debris", "#loc+building+id", "#status+verification", "#loc+name", "#description", "#geo+code+plus", "#indicator+accuracy", "#loc+adm1+code", "#loc+adm2+code", "#loc+adm3+code"}
 )
 
+// ToCSV is the in-memory wrapper over StreamCSV (tests + small callers); the
+// export endpoint streams from a DB cursor with extras from ModularKeysRaw.
 func ToCSV(reports []model.Report) []byte {
 	extras := extraModularColumns(reports, csvColumns)
-	header := append(append([]string{}, csvColumns...), extras...)
-	hxl := append([]string{}, hxlRow...)
-	for _, c := range extras {
-		hxl = append(hxl, "#indicator+"+c)
-	}
-
 	var b bytes.Buffer
-	b.WriteString(strings.Join(header, ","))
-	b.WriteString("\n")
-	b.WriteString(strings.Join(hxl, ",")) // HXL hashtag row
-	for _, r := range reports {
-		// Blank lat/lng for a location-unresolved report (never 0,0).
-		latStr, lngStr := "", ""
-		if reportResolved(r) {
-			latStr, lngStr = numPtr(r.Lat), numPtr(r.Lng)
-		}
-		flat := flattenModular(r.Modular)
-		row := []string{
-			r.ID, latStr, lngStr, r.CapturedAt.UTC().Format(time.RFC3339),
-			titleTier(r.DamageTier), r.Damage,
-			strings.Join(r.InfraTypes, ";"), deref(r.InfraName), deref(r.InfraOtherDetail), strings.Join(r.CrisisNature, ";"),
-			flat["electricity"], flat["health_services"], flat["pressing_needs"],
-			strconv.FormatBool(r.PossiblyDamaged), r.Debris, deref(r.BuildingID),
-			r.Verification, r.Place, exportDescription(r), deref(r.PlusCode), numPtr(r.GPSAccuracyMeters),
-			deref(r.Adm1Pcode), deref(r.Adm2Pcode), deref(r.Adm3Pcode),
-		}
-		for _, c := range extras {
-			row = append(row, flat[c])
-		}
-		for i := range row {
-			row[i] = csvCell(row[i])
-		}
-		b.WriteString("\n")
-		b.WriteString(strings.Join(row, ","))
-	}
+	// StreamCSV only errors on writer failure; bytes.Buffer never fails.
+	_ = StreamCSV(&b, sliceSource(reports), extras)
 	return b.Bytes()
 }
 
@@ -370,136 +285,15 @@ func gpbPoint(lng, lat float64) []byte {
 	return buf.Bytes()
 }
 
-// ToGPKG builds an OGC GeoPackage (single SQLite file) of the reports — a real,
-// interoperable, offline-friendly format, written with the pure-Go driver so the
-// static binary stays CGO-free.
+// ToGPKG is the in-memory wrapper over the streaming GeoPackage builder (tests +
+// small callers); the export endpoint streams the temp file straight to the client.
 func ToGPKG(reports []model.Report) ([]byte, error) {
-	f, err := os.CreateTemp("", "beacon-*.gpkg")
-	if err != nil {
+	var buf bytes.Buffer
+	extras := extraModularColumns(reports, gpkgAttrCols)
+	if err := StreamGPKG(&buf, sliceSource(reports), extras); err != nil {
 		return nil, err
 	}
-	path := f.Name()
-	f.Close()
-	defer os.Remove(path)
-
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
-	now := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
-	minX, minY, maxX, maxY := 180.0, 90.0, -180.0, -90.0
-	resolvedCount := 0
-	for _, r := range reports {
-		if !reportResolved(r) {
-			continue // skip unresolved (nil-coord) reports from the bbox
-		}
-		resolvedCount++
-		minX, maxX = min(minX, *r.Lng), max(maxX, *r.Lng)
-		minY, maxY = min(minY, *r.Lat), max(maxY, *r.Lat)
-	}
-	if resolvedCount == 0 {
-		minX, minY, maxX, maxY = 0, 0, 0, 0
-	}
-
-	// Attribute columns beyond geom: the fixed row schema, then the three stable
-	// modular sections, then any DYNAMIC modular extras (sanitized by
-	// extraModularColumns, so they are safe to splice into the DDL).
-	attrCols := []string{"id", "damage", "possibly_damaged", "verification", "infrastructure", "infrastructure_name", "infrastructure_other_detail", "crisis", "debris", "building_id", "place", "description", "plus_code", "admin2_pcode", "admin3_pcode", "captured_at"}
-	attrCols = append(attrCols, stableModularColumns...)
-	extras := extraModularColumns(reports, attrCols)
-	attrCols = append(attrCols, extras...)
-	ddlCols := make([]string, 0, len(attrCols))
-	marks := make([]string, 0, len(attrCols)+1)
-	marks = append(marks, "?") // geom
-	for _, c := range attrCols {
-		t := "TEXT"
-		if c == "possibly_damaged" {
-			t = "INTEGER"
-		}
-		ddlCols = append(ddlCols, c+" "+t)
-		marks = append(marks, "?")
-	}
-
-	stmts := []string{
-		`PRAGMA application_id = 1196444487`, // 'GPKG'
-		`PRAGMA user_version = 10300`,        // GeoPackage 1.3
-		`CREATE TABLE gpkg_spatial_ref_sys (srs_name TEXT NOT NULL, srs_id INTEGER PRIMARY KEY, organization TEXT NOT NULL, organization_coordsys_id INTEGER NOT NULL, definition TEXT NOT NULL, description TEXT)`,
-		`CREATE TABLE gpkg_contents (table_name TEXT NOT NULL PRIMARY KEY, data_type TEXT NOT NULL, identifier TEXT UNIQUE, description TEXT DEFAULT '', last_change DATETIME NOT NULL, min_x DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE, srs_id INTEGER)`,
-		`CREATE TABLE gpkg_geometry_columns (table_name TEXT NOT NULL, column_name TEXT NOT NULL, geometry_type_name TEXT NOT NULL, srs_id INTEGER NOT NULL, z TINYINT NOT NULL, m TINYINT NOT NULL, PRIMARY KEY (table_name, column_name))`,
-		// admin*_pcode: official OCHA COD-AB P-codes (source='cod') — see package doc for the GB: fallback.
-		`CREATE TABLE reports (fid INTEGER PRIMARY KEY AUTOINCREMENT, geom BLOB, ` + strings.Join(ddlCols, ", ") + `)`,
-	}
-	for _, s := range stmts {
-		if _, err := db.Exec(s); err != nil {
-			return nil, fmt.Errorf("gpkg ddl: %w", err)
-		}
-	}
-	srs := [][]any{
-		{"WGS 84 geographic", 4326, "EPSG", 4326, `GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]`, "longitude/latitude WGS84"},
-		{"Undefined cartesian SRS", -1, "NONE", -1, "undefined", "undefined cartesian coordinate reference system"},
-		{"Undefined geographic SRS", 0, "NONE", 0, "undefined", "undefined geographic coordinate reference system"},
-	}
-	for _, r := range srs {
-		if _, err := db.Exec(`INSERT INTO gpkg_spatial_ref_sys VALUES (?,?,?,?,?,?)`, r...); err != nil {
-			return nil, err
-		}
-	}
-	if _, err := db.Exec(`INSERT INTO gpkg_contents (table_name, data_type, identifier, description, last_change, min_x, min_y, max_x, max_y, srs_id) VALUES ('reports','features','reports','Beacon community damage reports',?,?,?,?,?,4326)`,
-		now, minX, minY, maxX, maxY); err != nil {
-		return nil, err
-	}
-	if _, err := db.Exec(`INSERT INTO gpkg_geometry_columns VALUES ('reports','geom','POINT',4326,0,0)`); err != nil {
-		return nil, err
-	}
-
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	ins, err := tx.Prepare(`INSERT INTO reports (geom, ` + strings.Join(attrCols, ", ") + `) VALUES (` + strings.Join(marks, ",") + `)`)
-	if err != nil {
-		tx.Rollback()
-		return nil, err
-	}
-	for _, r := range reports {
-		pd := 0
-		if r.PossiblyDamaged {
-			pd = 1
-		}
-		// Store NULL geom for a location-unresolved report (never gpbPoint(0,0)).
-		var geomBlob any
-		if reportResolved(r) {
-			geomBlob = gpbPoint(*r.Lng, *r.Lat)
-		}
-		flat := flattenModular(r.Modular)
-		args := []any{geomBlob, r.ID, r.Damage, pd, r.Verification,
-			strings.Join(r.InfraTypes, ";"), deref(r.InfraName), deref(r.InfraOtherDetail),
-			strings.Join(r.CrisisNature, ";"), r.Debris,
-			deref(r.BuildingID), r.Place, exportDescription(r), deref(r.PlusCode),
-			deref(r.Adm2Pcode), deref(r.Adm3Pcode),
-			r.CapturedAt.UTC().Format(time.RFC3339)}
-		for _, c := range stableModularColumns {
-			args = append(args, flat[c])
-		}
-		for _, c := range extras {
-			args = append(args, flat[c])
-		}
-		if _, err := ins.Exec(args...); err != nil {
-			ins.Close()
-			tx.Rollback()
-			return nil, err
-		}
-	}
-	ins.Close()
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	if err := db.Close(); err != nil {
-		return nil, err
-	}
-	return os.ReadFile(path)
+	return buf.Bytes(), nil
 }
 
 // xmlEscape escapes text for inclusion in KML element bodies.
@@ -514,39 +308,10 @@ func xmlEscape(s string) string {
 // placemark carries a short description with the C2 gate fields (damage
 // classification, infrastructure type, hazard type) and the secondary impacts. This
 // is the "KML is a nice add if cheap" deliverable; it opens directly in Google Earth.
+// ToKML is the in-memory wrapper over StreamKML (tests + small callers); the
+// export endpoint streams from a DB cursor.
 func ToKML(reports []model.Report) []byte {
 	var b bytes.Buffer
-	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
-	b.WriteString(`<kml xmlns="http://www.opengis.net/kml/2.2"><Document>` + "\n")
-	b.WriteString(`<name>Beacon community damage reports</name>` + "\n")
-	for _, r := range reports {
-		if !reportResolved(r) {
-			continue
-		}
-		// Modular sections (stable three + dynamic extras) in sorted key order.
-		flat := flattenModular(r.Modular)
-		keys := make([]string, 0, len(flat))
-		for k := range flat {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		var impacts strings.Builder
-		for _, k := range keys {
-			impacts.WriteString(fmt.Sprintf("%s: %s\n", k, flat[k]))
-		}
-		desc := fmt.Sprintf(
-			"damage_classification: %s\ninfrastructure_type: %s\ninfrastructure_name: %s\ninfrastructure_other_detail: %s\nhazard_type: %s\n%sdescription: %s\nplus_code: %s\nverification: %s\ntimestamp: %s",
-			titleTier(r.DamageTier), strings.Join(r.InfraTypes, ";"), deref(r.InfraName), deref(r.InfraOtherDetail),
-			strings.Join(r.CrisisNature, ";"), impacts.String(),
-			exportDescription(r), deref(r.PlusCode),
-			r.Verification, r.CapturedAt.UTC().Format(time.RFC3339))
-		b.WriteString("<Placemark>")
-		b.WriteString("<name>" + xmlEscape(r.ID) + "</name>")
-		b.WriteString("<description>" + xmlEscape(desc) + "</description>")
-		b.WriteString(fmt.Sprintf("<Point><coordinates>%s,%s</coordinates></Point>",
-			strconv.FormatFloat(*r.Lng, 'g', -1, 64), strconv.FormatFloat(*r.Lat, 'g', -1, 64)))
-		b.WriteString("</Placemark>\n")
-	}
-	b.WriteString(`</Document></kml>`)
+	_ = StreamKML(&b, sliceSource(reports))
 	return b.Bytes()
 }

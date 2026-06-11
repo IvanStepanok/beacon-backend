@@ -2,9 +2,12 @@ package service
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"encoding/binary"
+	"io"
 	"math"
+	"os"
 	"strings"
 	"time"
 
@@ -39,77 +42,139 @@ var shapefileFields = []shpField{
 	{"timestamp", 20, func(r model.Report) string { return r.CapturedAt.UTC().Format(time.RFC3339) }},
 }
 
-// ToShapefile renders RESOLVED reports as an ESRI Shapefile (POINT), returning a ZIP
-// of the .shp/.shx/.dbf/.prj members. Landmark-only (unresolved) reports cannot be a
-// shapefile POINT record and are skipped (never emitted at 0,0) — they remain in the
-// GeoJSON/CSV exports.
+// ToShapefile is the in-memory wrapper over StreamShapefile (tests + small
+// callers); the export endpoint streams the ZIP straight to the client.
 func ToShapefile(reports []model.Report) ([]byte, error) {
-	pts := make([]model.Report, 0, len(reports))
-	for _, r := range reports {
-		if reportResolved(r) {
-			pts = append(pts, r)
-		}
+	var buf bytes.Buffer
+	if err := StreamShapefile(&buf, sliceSource(reports)); err != nil {
+		return nil, err
 	}
+	return buf.Bytes(), nil
+}
 
+// StreamShapefile writes the .shp/.shx/.dbf/.prj ZIP for RESOLVED reports while
+// bounding RAM at crisis scale: the three variable-length member BODIES are staged
+// to temp files in a SINGLE cursor pass (the .shp/.shx/.dbf headers need the final
+// record count + bbox up front, so bodies are written first, then prefixed with
+// their headers as the ZIP is assembled). The ZIP itself streams to w. Landmark-only
+// (unresolved) reports can't be a POINT record and are skipped (never 0,0).
+func StreamShapefile(w io.Writer, src RowSource) error {
 	const headerLen = 100
 	const recordLen = 8 + 20 // 8-byte record header + point content (4 type + 8 X + 8 Y)
 
+	shpTmp, err := os.CreateTemp("", "beacon-*.shpbody")
+	if err != nil {
+		return err
+	}
+	shxTmp, err := os.CreateTemp("", "beacon-*.shxbody")
+	if err != nil {
+		shpTmp.Close()
+		os.Remove(shpTmp.Name())
+		return err
+	}
+	dbfTmp, err := os.CreateTemp("", "beacon-*.dbfbody")
+	if err != nil {
+		shpTmp.Close()
+		os.Remove(shpTmp.Name())
+		shxTmp.Close()
+		os.Remove(shxTmp.Name())
+		return err
+	}
+	defer func() {
+		shpTmp.Close()
+		os.Remove(shpTmp.Name())
+		shxTmp.Close()
+		os.Remove(shxTmp.Name())
+		dbfTmp.Close()
+		os.Remove(dbfTmp.Name())
+	}()
+
+	shpW := bufio.NewWriterSize(shpTmp, 64*1024)
+	shxW := bufio.NewWriterSize(shxTmp, 64*1024)
+	dbfW := bufio.NewWriterSize(dbfTmp, 64*1024)
+
 	minX, minY, maxX, maxY := 0.0, 0.0, 0.0, 0.0
-	for i, r := range pts {
-		x, y := *r.Lng, *r.Lat
-		if i == 0 {
-			minX, maxX, minY, maxY = x, x, y, y
-			continue
-		}
-		minX, maxX = math.Min(minX, x), math.Max(maxX, x)
-		minY, maxY = math.Min(minY, y), math.Max(maxY, y)
-	}
-
-	shp := &bytes.Buffer{}
-	shx := &bytes.Buffer{}
-	shp.Write(shpHeader(headerLen+len(pts)*recordLen, minX, minY, maxX, maxY))
-	shx.Write(shpHeader(headerLen+len(pts)*8, minX, minY, maxX, maxY))
-
+	count := 0
 	offsetWords := headerLen / 2
-	for i, r := range pts {
-		// .shp record: header is BIG-endian, geometry content is LITTLE-endian.
-		_ = binary.Write(shp, binary.BigEndian, int32(i+1)) // record number (1-based)
-		_ = binary.Write(shp, binary.BigEndian, int32(10))  // content length in 16-bit words: (4+8+8)/2
-		_ = binary.Write(shp, binary.LittleEndian, int32(1))    // shape type: Point
-		_ = binary.Write(shp, binary.LittleEndian, *r.Lng)      // X
-		_ = binary.Write(shp, binary.LittleEndian, *r.Lat)      // Y
+	err = src(func(r *model.Report) error {
+		if !reportResolved(*r) {
+			return nil
+		}
+		x, y := *r.Lng, *r.Lat
+		if count == 0 {
+			minX, maxX, minY, maxY = x, x, y, y
+		} else {
+			minX, maxX = math.Min(minX, x), math.Max(maxX, x)
+			minY, maxY = math.Min(minY, y), math.Max(maxY, y)
+		}
+		count++
+		// .shp record: header BIG-endian, geometry content LITTLE-endian.
+		_ = binary.Write(shpW, binary.BigEndian, int32(count)) // record number (1-based)
+		_ = binary.Write(shpW, binary.BigEndian, int32(10))    // content length in words: (4+8+8)/2
+		_ = binary.Write(shpW, binary.LittleEndian, int32(1))  // shape type: Point
+		_ = binary.Write(shpW, binary.LittleEndian, x)
+		_ = binary.Write(shpW, binary.LittleEndian, y)
 		// .shx index record (BIG-endian): offset + content length, both in words.
-		_ = binary.Write(shx, binary.BigEndian, int32(offsetWords))
-		_ = binary.Write(shx, binary.BigEndian, int32(10))
+		_ = binary.Write(shxW, binary.BigEndian, int32(offsetWords))
+		_ = binary.Write(shxW, binary.BigEndian, int32(10))
 		offsetWords += recordLen / 2
+		// .dbf record: deletion flag + fixed-width ASCII fields.
+		dbfW.WriteByte(0x20)
+		for _, f := range shapefileFields {
+			dbfW.Write(asciiFixed(f.value(*r), f.width))
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, fw := range []*bufio.Writer{shpW, shxW, dbfW} {
+		if err := fw.Flush(); err != nil {
+			return err
+		}
+	}
+	for _, tf := range []*os.File{shpTmp, shxTmp, dbfTmp} {
+		if _, err := tf.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+	}
+	if count == 0 {
+		minX, minY, maxX, maxY = 0, 0, 0, 0
 	}
 
-	dbf := buildDBF(pts)
-
-	out := &bytes.Buffer{}
-	zw := zip.NewWriter(out)
-	members := []struct {
-		name string
-		data []byte
-	}{
-		{"beacon-reports.shp", shp.Bytes()},
-		{"beacon-reports.shx", shx.Bytes()},
-		{"beacon-reports.dbf", dbf},
-		{"beacon-reports.prj", []byte(wgs84PRJ)},
+	zw := zip.NewWriter(w)
+	type member struct {
+		name   string
+		header []byte
+		body   *os.File
+		footer []byte
+	}
+	members := []member{
+		{"beacon-reports.shp", shpHeader(headerLen+count*recordLen, minX, minY, maxX, maxY), shpTmp, nil},
+		{"beacon-reports.shx", shpHeader(headerLen+count*8, minX, minY, maxX, maxY), shxTmp, nil},
+		{"beacon-reports.dbf", dbfHeader(count), dbfTmp, []byte{0x1A}}, // 0x1A = dBASE EOF
+		{"beacon-reports.prj", []byte(wgs84PRJ), nil, nil},
 	}
 	for _, m := range members {
 		f, err := zw.Create(m.name)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if _, err := f.Write(m.data); err != nil {
-			return nil, err
+		if _, err := f.Write(m.header); err != nil {
+			return err
+		}
+		if m.body != nil {
+			if _, err := io.Copy(f, m.body); err != nil {
+				return err
+			}
+		}
+		if m.footer != nil {
+			if _, err := f.Write(m.footer); err != nil {
+				return err
+			}
 		}
 	}
-	if err := zw.Close(); err != nil {
-		return nil, err
-	}
-	return out.Bytes(), nil
+	return zw.Close()
 }
 
 // shpHeader builds the 100-byte .shp/.shx header. File code + file length are
@@ -128,9 +193,11 @@ func shpHeader(fileLenBytes int, minX, minY, maxX, maxY float64) []byte {
 	return h
 }
 
-// buildDBF writes a dBASE III table: header + field descriptors + fixed-width,
-// space-padded ASCII records, one per point.
-func buildDBF(reports []model.Report) []byte {
+// dbfHeader writes the dBASE III table header: the 32-byte file header (with the
+// final record count) + the field descriptors + the 0x0D terminator. The records
+// themselves are streamed separately by StreamShapefile, and the 0x1A EOF byte is
+// appended after them — so the full .dbf is dbfHeader + records + 0x1A.
+func dbfHeader(count int) []byte {
 	recordSize := 1 // leading deletion flag
 	for _, f := range shapefileFields {
 		recordSize += f.width
@@ -141,7 +208,7 @@ func buildDBF(reports []model.Report) []byte {
 	b.WriteByte(0x03) // dBASE III, no memo
 	now := time.Now().UTC()
 	b.Write([]byte{byte(now.Year() - 1900), byte(int(now.Month())), byte(now.Day())})
-	_ = binary.Write(b, binary.LittleEndian, uint32(len(reports)))
+	_ = binary.Write(b, binary.LittleEndian, uint32(count))
 	_ = binary.Write(b, binary.LittleEndian, uint16(headerSize))
 	_ = binary.Write(b, binary.LittleEndian, uint16(recordSize))
 	b.Write(make([]byte, 20)) // reserved
@@ -157,14 +224,6 @@ func buildDBF(reports []model.Report) []byte {
 		b.Write(make([]byte, 14)) // reserved
 	}
 	b.WriteByte(0x0D) // header terminator
-
-	for _, r := range reports {
-		b.WriteByte(0x20) // record present (not deleted)
-		for _, f := range shapefileFields {
-			b.Write(asciiFixed(f.value(r), f.width))
-		}
-	}
-	b.WriteByte(0x1A) // EOF
 	return b.Bytes()
 }
 

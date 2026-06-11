@@ -3,6 +3,7 @@ package handler
 import (
 	"net/http"
 
+	"github.com/stepanok/beacon-server/internal/model"
 	"github.com/stepanok/beacon-server/internal/service"
 	"github.com/stepanok/beacon-server/internal/store"
 )
@@ -49,53 +50,60 @@ func (h *Handlers) ExportReports(w http.ResponseWriter, r *http.Request) {
 		BBox:         bbox,
 	}
 
-	reports, err := h.d.Reports.ExportRows(r.Context(), f)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "internal", "export query failed")
-		return
+	// Stream every matching row from a DB cursor straight to the response: at
+	// crisis scale (100k–500k) the prior materialize-then-encode path peaked at
+	// multi-GB RSS and would OOM the host. RAM now stays at one row (text formats)
+	// or a temp file on disk (GPKG/Shapefile binary containers). NOTE: headers are
+	// committed before the first row, so a mid-stream query error can no longer be
+	// turned into a clean HTTP error code — it truncates the download instead (the
+	// query itself is a single SELECT, so this is a remote edge case).
+	src := func(yield func(*model.Report) error) error {
+		return h.d.Reports.ExportEach(r.Context(), f, yield)
 	}
 
 	switch format {
 	case "geojson":
-		body, err := service.ToGeoJSON(reports)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "internal", "encode failed")
-			return
-		}
 		w.Header().Set("Content-Type", "application/geo+json")
 		w.Header().Set("Content-Disposition", `attachment; filename="beacon-reports.geojson"`)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(body)
+		_ = service.StreamGeoJSON(w, src)
 	case "csv":
+		keys, err := h.d.Reports.ModularKeysRaw(r.Context(), f)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "internal", "export query failed")
+			return
+		}
 		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 		w.Header().Set("Content-Disposition", `attachment; filename="beacon-reports.csv"`)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(service.ToCSV(reports))
+		_ = service.StreamCSV(w, src, service.CSVExtraColumns(keys))
 	case "gpkg":
-		body, err := service.ToGPKG(reports)
+		keys, err := h.d.Reports.ModularKeysRaw(r.Context(), f)
 		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "internal", "export query failed")
+			return
+		}
+		// GPKG builds to a temp file first, so a build error surfaces before any
+		// body bytes are written (the status is still settable until io.Copy starts).
+		w.Header().Set("Content-Type", "application/geopackage+sqlite3")
+		w.Header().Set("Content-Disposition", `attachment; filename="beacon-reports.gpkg"`)
+		if err := service.StreamGPKG(w, src, service.GPKGExtraColumns(keys)); err != nil {
+			// Best-effort: if nothing was written yet the status is still settable.
 			writeErr(w, http.StatusInternalServerError, "internal", "gpkg build failed")
 			return
 		}
-		w.Header().Set("Content-Type", "application/geopackage+sqlite3")
-		w.Header().Set("Content-Disposition", `attachment; filename="beacon-reports.gpkg"`)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(body)
 	case "kml":
 		w.Header().Set("Content-Type", "application/vnd.google-earth.kml+xml")
 		w.Header().Set("Content-Disposition", `attachment; filename="beacon-reports.kml"`)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(service.ToKML(reports))
+		_ = service.StreamKML(w, src)
 	case "shapefile", "shp":
-		body, err := service.ToShapefile(reports)
-		if err != nil {
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Disposition", `attachment; filename="beacon-reports.shp.zip"`)
+		if err := service.StreamShapefile(w, src); err != nil {
 			writeErr(w, http.StatusInternalServerError, "internal", "shapefile build failed")
 			return
 		}
-		w.Header().Set("Content-Type", "application/zip")
-		w.Header().Set("Content-Disposition", `attachment; filename="beacon-reports.shp.zip"`)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(body)
 	default:
 		writeErr(w, http.StatusBadRequest, "bad_format", "format must be geojson|csv|gpkg|kml|shapefile")
 	}

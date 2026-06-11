@@ -16,6 +16,11 @@ import (
 	"github.com/stepanok/beacon-server/internal/model"
 )
 
+// mapPinCap bounds the latest-per-building map-pin payload (see LatestPerBuilding).
+// Tuned so the worst-case JSON response stays well under ~5 MB regardless of how
+// many reports a crisis holds; full-density rendering uses the MVT tile endpoint.
+const mapPinCap = 5000
+
 // reportSelect lists every column read for a Report, plus a SQL-computed ageMin
 // (minutes since capture, relative to now() — live data ages, seed parity holds
 // at seed time because the seeder sets captured_at = now()-ageMin).
@@ -506,7 +511,15 @@ func (s *Reports) LatestPerBuilding(ctx context.Context, crisisID string, bbox *
 		conds = append(conds, "verification = 'verified'")
 	}
 	inner := "SELECT r.*, row_number() OVER (PARTITION BY building_id ORDER BY captured_at DESC, id DESC) AS rn FROM reports r WHERE " + strings.Join(conds, " AND ")
-	sql := "SELECT " + reportSelect + " FROM (" + inner + ") q WHERE q.building_id IS NULL OR q.rn = 1 ORDER BY captured_at DESC, id DESC"
+	// Hard cap: this powers the map-pin endpoints (dashboard /map/features +
+	// mobile community feed), which serialize the whole result into one JSON
+	// payload. Reports lacking a building_id never collapse via rn=1, so at
+	// crisis scale (100k–500k) an uncapped query would build a 100–260 MB
+	// response and risk OOM on a memory-tight host. The most-recent N (ordered
+	// captured_at DESC) is plenty for pin rendering; the full-density map at
+	// scale is served by the clustered MVT tile endpoint (MapTileMVT), and the
+	// complete dataset by the analyst export path (ExportRows) — neither capped.
+	sql := "SELECT " + reportSelect + " FROM (" + inner + ") q WHERE q.building_id IS NULL OR q.rn = 1 ORDER BY captured_at DESC, id DESC LIMIT " + strconv.Itoa(mapPinCap)
 	rows, err := s.pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
@@ -528,7 +541,7 @@ const publicTileSnapDegrees = 0.001
 // public ~110m grid (consistent with publicProjection) so exact reporter positions
 // are never emitted at high zoom. In-scope analysts (publicTier=false) keep exact
 // geometry and all statuses. Returns raw .mvt protobuf bytes.
-func (s *Reports) MapTileMVT(ctx context.Context, z, x, y int, crisisID string, publicTier bool) ([]byte, error) {
+func (s *Reports) MapTileMVT(ctx context.Context, z, x, y int, crisisID string, publicTier bool, damage, verification []string) ([]byte, error) {
 	conds := "r.geom && ST_Transform(b.b3857, 4326)"
 	var mvt []byte
 	if z >= 13 {
@@ -537,6 +550,16 @@ func (s *Reports) MapTileMVT(ctx context.Context, z, x, y int, crisisID string, 
 		if crisisID != "" {
 			conds += fmt.Sprintf(" AND r.crisis_id = $%d", n)
 			args = append(args, crisisID)
+			n++
+		}
+		if len(damage) > 0 {
+			conds += fmt.Sprintf(" AND r.damage_tier = ANY($%d)", n)
+			args = append(args, damage)
+			n++
+		}
+		if len(verification) > 0 {
+			conds += fmt.Sprintf(" AND r.verification = ANY($%d)", n)
+			args = append(args, verification)
 			n++
 		}
 		if publicTier {
@@ -575,6 +598,16 @@ func (s *Reports) MapTileMVT(ctx context.Context, z, x, y int, crisisID string, 
 	if crisisID != "" {
 		conds += fmt.Sprintf(" AND r.crisis_id = $%d", n)
 		args = append(args, crisisID)
+		n++
+	}
+	if len(damage) > 0 {
+		conds += fmt.Sprintf(" AND r.damage_tier = ANY($%d)", n)
+		args = append(args, damage)
+		n++
+	}
+	if len(verification) > 0 {
+		conds += fmt.Sprintf(" AND r.verification = ANY($%d)", n)
+		args = append(args, verification)
 		n++
 	}
 	if publicTier {

@@ -225,7 +225,11 @@ func (h *Handlers) ReportTile(w http.ResponseWriter, r *http.Request) {
 	// Public tier (anonymous OR the low-trust external_viewer) gets verified reports
 	// only AND coarsened point geometry at high zoom; only the real analyst roles see
 	// all statuses at exact precision.
-	mvt, err := h.d.Reports.MapTileMVT(r.Context(), z, x, y, r.URL.Query().Get("crisisId"), isPublicTier(r))
+	// Optional analyst filter chips (damage tier / verification) ride along as
+	// repeated query params, applied server-side so a filtered map still ships
+	// only the matching tile geometry — never the whole dataset.
+	mvt, err := h.d.Reports.MapTileMVT(r.Context(), z, x, y, r.URL.Query().Get("crisisId"), isPublicTier(r),
+		qList(r, "damage"), qList(r, "verification"))
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "internal", "tile render failed")
 		return
