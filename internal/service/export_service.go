@@ -21,13 +21,15 @@ import (
 )
 
 // Export produces interoperable formats so Beacon data drops straight into the
-// humanitarian stack: GeoJSON + HXL-tagged CSV (with admin_shapeid columns) +
+// humanitarian stack: GeoJSON + HXL-tagged CSV (with admin P-code columns) +
 // GeoPackage (OGC, single offline file) + KML.
 //
-// The exported admin columns are admin_shapeid (geoBoundaries shapeID / illustrative
-// seed codes) — NOT official OCHA P-codes until a source=cod layer exists. They are
-// still a valid join key against the admin_areas table, but must not be labelled
-// "P-code", which would assert a provenance Beacon does not yet have.
+// The exported admin columns are admin{1,2,3}_pcode — the OCHA COD-AB P-code the point
+// reverse-geocoded to (source='cod'; ResolveAdmin ranks COD highest), so the data is
+// natively joinable against the official COD-AB / HDX humanitarian datasets. HXL tags
+// use +code accordingly. A `GB:`-prefixed value is the honest exception: a geoBoundaries
+// shapeID placeholder for a country not yet published as a COD (no official P-code
+// available) — filter those out for a strict P-code join.
 //
 // Per the C2 export contract, GeoJSON Feature geometry is a Point [lng, lat] in
 // decimal degrees (or null when the report's location is unresolved), and properties
@@ -268,13 +270,13 @@ func ToGeoJSON(reports []model.Report) ([]byte, error) {
 			props["accuracy_m"] = v
 		}
 		if v := deref(r.Adm1Pcode); v != "" {
-			props["admin1_shapeid"] = v
+			props["admin1_pcode"] = v
 		}
 		if v := deref(r.Adm2Pcode); v != "" {
-			props["admin2_shapeid"] = v
+			props["admin2_pcode"] = v
 		}
 		if v := deref(r.Adm3Pcode); v != "" {
-			props["admin3_shapeid"] = v
+			props["admin3_pcode"] = v
 		}
 		fc.Features = append(fc.Features, exportFeature{
 			Type:       "Feature",
@@ -304,14 +306,15 @@ func csvCell(s string) string {
 }
 
 // csvColumns is the C2 export schema; hxlRow tags each column with its HXL hashtag so
-// OCHA tooling can machine-merge the file. The admin columns are admin_shapeid
-// columns (geoBoundaries shapeID / illustrative seed codes — NOT official OCHA
-// P-codes until a source=cod layer exists); their HXL tags use +id (not +code) so the
-// file never falsely asserts a P-code provenance. Any DYNAMIC modular sections beyond
-// the three stable ones are appended after these fixed columns (#indicator+<name>).
+// OCHA tooling can machine-merge the file. The admin columns are admin{1,2,3}_pcode — the
+// official OCHA COD-AB P-code the point reverse-geocoded to (source='cod'); their HXL tags
+// use +code so the file joins natively against COD-AB. A `GB:`-prefixed value is a
+// geoBoundaries shapeID placeholder for a country with no published COD (honest fallback).
+// Any DYNAMIC modular sections beyond the three stable ones are appended after these fixed
+// columns (#indicator+<name>).
 var (
-	csvColumns = []string{"id", "latitude", "longitude", "timestamp", "damage_classification", "damage", "infrastructure_type", "infrastructure_name", "infrastructure_other_detail", "hazard_type", "electricity", "health_services", "pressing_needs", "possiblyDamaged", "debris", "buildingId", "verification", "place", "description", "plus_code", "accuracy_m", "admin1_shapeid", "admin2_shapeid", "admin3_shapeid"}
-	hxlRow     = []string{"#meta+id", "#geo+lat", "#geo+lon", "#date", "#severity+grade", "#severity+raw", "#sector", "#loc+name+infrastructure", "#loc+name+infrastructure+detail", "#cause", "#indicator+electricity", "#indicator+health", "#indicator+needs", "#indicator+possibly", "#indicator+debris", "#loc+building+id", "#status+verification", "#loc+name", "#description", "#geo+code+plus", "#indicator+accuracy", "#loc+adm1+id", "#loc+adm2+id", "#loc+adm3+id"}
+	csvColumns = []string{"id", "latitude", "longitude", "timestamp", "damage_classification", "damage", "infrastructure_type", "infrastructure_name", "infrastructure_other_detail", "hazard_type", "electricity", "health_services", "pressing_needs", "possiblyDamaged", "debris", "buildingId", "verification", "place", "description", "plus_code", "accuracy_m", "admin1_pcode", "admin2_pcode", "admin3_pcode"}
+	hxlRow     = []string{"#meta+id", "#geo+lat", "#geo+lon", "#date", "#severity+grade", "#severity+raw", "#sector", "#loc+name+infrastructure", "#loc+name+infrastructure+detail", "#cause", "#indicator+electricity", "#indicator+health", "#indicator+needs", "#indicator+possibly", "#indicator+debris", "#loc+building+id", "#status+verification", "#loc+name", "#description", "#geo+code+plus", "#indicator+accuracy", "#loc+adm1+code", "#loc+adm2+code", "#loc+adm3+code"}
 )
 
 func ToCSV(reports []model.Report) []byte {
@@ -403,7 +406,7 @@ func ToGPKG(reports []model.Report) ([]byte, error) {
 	// Attribute columns beyond geom: the fixed row schema, then the three stable
 	// modular sections, then any DYNAMIC modular extras (sanitized by
 	// extraModularColumns, so they are safe to splice into the DDL).
-	attrCols := []string{"id", "damage", "possibly_damaged", "verification", "infrastructure", "infrastructure_name", "infrastructure_other_detail", "crisis", "debris", "building_id", "place", "description", "plus_code", "admin2_shapeid", "admin3_shapeid", "captured_at"}
+	attrCols := []string{"id", "damage", "possibly_damaged", "verification", "infrastructure", "infrastructure_name", "infrastructure_other_detail", "crisis", "debris", "building_id", "place", "description", "plus_code", "admin2_pcode", "admin3_pcode", "captured_at"}
 	attrCols = append(attrCols, stableModularColumns...)
 	extras := extraModularColumns(reports, attrCols)
 	attrCols = append(attrCols, extras...)
@@ -425,7 +428,7 @@ func ToGPKG(reports []model.Report) ([]byte, error) {
 		`CREATE TABLE gpkg_spatial_ref_sys (srs_name TEXT NOT NULL, srs_id INTEGER PRIMARY KEY, organization TEXT NOT NULL, organization_coordsys_id INTEGER NOT NULL, definition TEXT NOT NULL, description TEXT)`,
 		`CREATE TABLE gpkg_contents (table_name TEXT NOT NULL PRIMARY KEY, data_type TEXT NOT NULL, identifier TEXT UNIQUE, description TEXT DEFAULT '', last_change DATETIME NOT NULL, min_x DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE, srs_id INTEGER)`,
 		`CREATE TABLE gpkg_geometry_columns (table_name TEXT NOT NULL, column_name TEXT NOT NULL, geometry_type_name TEXT NOT NULL, srs_id INTEGER NOT NULL, z TINYINT NOT NULL, m TINYINT NOT NULL, PRIMARY KEY (table_name, column_name))`,
-		// admin*_shapeid (NOT adm*_pcode): same provenance caveat as GeoJSON/CSV — see package doc.
+		// admin*_pcode: official OCHA COD-AB P-codes (source='cod') — see package doc for the GB: fallback.
 		`CREATE TABLE reports (fid INTEGER PRIMARY KEY AUTOINCREMENT, geom BLOB, ` + strings.Join(ddlCols, ", ") + `)`,
 	}
 	for _, s := range stmts {

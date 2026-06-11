@@ -68,8 +68,9 @@ func TestToGeoJSON_C2Properties(t *testing.T) {
 		t.Errorf("GeoJSON missing lng/lat coordinates\n%s", s)
 	}
 
-	// The mislabelled P-code property names must be ABSENT.
-	for _, forbidden := range []string{"Pcode", "adm1Pcode", "#adm"} {
+	// The GeoJSON uses snake_case admin*_pcode props (asserted via the CSV/GPKG tests); the
+	// internal camelCase alias (adm1Pcode) and HXL hashtags must never leak into the GeoJSON.
+	for _, forbidden := range []string{"adm1Pcode", "#adm"} {
 		if strings.Contains(s, forbidden) {
 			t.Errorf("GeoJSON must not contain %q\n%s", forbidden, s)
 		}
@@ -133,19 +134,19 @@ func TestToCSV_C2HeadersAndUnresolved(t *testing.T) {
 		t.Fatalf("expected header + hxl + 2 rows, got %d lines:\n%s", len(lines), out)
 	}
 	header := lines[0]
-	for _, col := range []string{"latitude", "longitude", "timestamp", "damage_classification", "infrastructure_type", "infrastructure_name", "hazard_type", "electricity", "health_services", "pressing_needs", "description", "plus_code", "admin1_shapeid", "pressing_needs_other", "shelter_condition"} {
+	for _, col := range []string{"latitude", "longitude", "timestamp", "damage_classification", "infrastructure_type", "infrastructure_name", "hazard_type", "electricity", "health_services", "pressing_needs", "description", "plus_code", "admin1_pcode", "pressing_needs_other", "shelter_condition"} {
 		if !strings.Contains(header, col) {
 			t.Errorf("CSV header missing column %q\nheader: %s", col, header)
 		}
 	}
 	// Dynamic modular columns are APPENDED after the fixed schema (sorted), so the
 	// stable column positions never shift under existing consumers.
-	if !strings.HasSuffix(header, "admin3_shapeid,pressing_needs_other,shelter_condition") {
+	if !strings.HasSuffix(header, "admin3_pcode,pressing_needs_other,shelter_condition") {
 		t.Errorf("dynamic modular columns must be appended after the fixed schema: %s", header)
 	}
-	// HXL row must NOT assert P-codes, and must tag the dynamic columns.
-	if strings.Contains(lines[1], "#adm") && strings.Contains(lines[1], "+code") {
-		t.Errorf("HXL row must not use #adm*+code (asserts P-code): %s", lines[1])
+	// HXL row tags the admin columns as official P-codes (B5) + tags the dynamic columns.
+	if !strings.Contains(lines[1], "#loc+adm1+code") {
+		t.Errorf("HXL row must tag admin1 as a P-code (#loc+adm1+code): %s", lines[1])
 	}
 	if !strings.Contains(lines[1], "#indicator+shelter_condition") {
 		t.Errorf("HXL row missing dynamic column tag: %s", lines[1])
@@ -191,15 +192,14 @@ func TestToKML_SkipsUnresolved(t *testing.T) {
 	}
 }
 
-// TestToGPKG_AdminShapeidColumns locks the GPKG relabel: the reports table must use
-// admin2_shapeid/admin3_shapeid (geoBoundaries shapeIDs / seed codes), never a column
-// name containing "pcode" — which would assert an OCHA provenance Beacon doesn't have.
+// TestToGPKG_AdminPcodeColumns locks the GPKG admin schema (B5): the reports table uses
+// admin2_pcode/admin3_pcode (the official OCHA COD-AB P-code the point resolved to).
 // Reopening the produced file also proves the INSERT was renamed in lockstep (a stale
-// adm*_pcode INSERT would make ToGPKG itself fail with "no such column").
-func TestToGPKG_AdminShapeidColumns(t *testing.T) {
+// admin*_shapeid INSERT would make ToGPKG itself fail with "no such column").
+func TestToGPKG_AdminPcodeColumns(t *testing.T) {
 	r := fixtureResolved()
-	r.Adm2Pcode = strPtr("TR6303")
-	r.Adm3Pcode = strPtr("TR630305")
+	r.Adm2Pcode = strPtr("TUR031")
+	r.Adm3Pcode = strPtr("TUR031002")
 
 	body, err := ToGPKG([]model.Report{r})
 	if err != nil {
@@ -219,21 +219,18 @@ func TestToGPKG_AdminShapeidColumns(t *testing.T) {
 	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='reports'`).Scan(&ddl); err != nil {
 		t.Fatalf("read reports DDL: %v", err)
 	}
-	if strings.Contains(strings.ToLower(ddl), "pcode") {
-		t.Errorf("GPKG reports DDL must not contain %q:\n%s", "pcode", ddl)
-	}
-	for _, col := range []string{"admin2_shapeid", "admin3_shapeid", "infrastructure_name", "description", "plus_code", "electricity", "health_services", "pressing_needs", "shelter_condition"} {
+	for _, col := range []string{"admin2_pcode", "admin3_pcode", "infrastructure_name", "description", "plus_code", "electricity", "health_services", "pressing_needs", "shelter_condition"} {
 		if !strings.Contains(ddl, col) {
 			t.Errorf("GPKG reports DDL missing column %q:\n%s", col, ddl)
 		}
 	}
 
 	var adm2, adm3 string
-	if err := db.QueryRow(`SELECT admin2_shapeid, admin3_shapeid FROM reports WHERE id = 'r-1'`).Scan(&adm2, &adm3); err != nil {
-		t.Fatalf("read renamed admin columns: %v", err)
+	if err := db.QueryRow(`SELECT admin2_pcode, admin3_pcode FROM reports WHERE id = 'r-1'`).Scan(&adm2, &adm3); err != nil {
+		t.Fatalf("read admin P-code columns: %v", err)
 	}
-	if adm2 != "TR6303" || adm3 != "TR630305" {
-		t.Errorf("admin shapeid values = %q/%q, want TR6303/TR630305", adm2, adm3)
+	if adm2 != "TUR031" || adm3 != "TUR031002" {
+		t.Errorf("admin P-code values = %q/%q, want TUR031/TUR031002", adm2, adm3)
 	}
 
 	var infraName, desc, plusCode, shelter string
@@ -297,7 +294,7 @@ func TestExport_ReservedModularKeys(t *testing.T) {
 
 	// CSV: same renamed columns, appended after the fixed schema.
 	lines := strings.Split(string(ToCSV([]model.Report{r})), "\n")
-	if !strings.HasSuffix(lines[0], "admin3_shapeid,x_fid,x_geom") {
+	if !strings.HasSuffix(lines[0], "admin3_pcode,x_fid,x_geom") {
 		t.Errorf("CSV header must append the renamed x_ columns: %s", lines[0])
 	}
 }

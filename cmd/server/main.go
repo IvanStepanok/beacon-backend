@@ -113,10 +113,14 @@ func run() error {
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Back-fill Areas for any existing reports whose country has no ADM1 loaded yet
-	// (e.g. reports submitted before this feature). Background, best-effort.
+	// Back-fill Areas for existing reports. Background, best-effort. First ensure official COD-AB
+	// P-codes for every reported country (upgrades reports tagged earlier via geoBoundaries/seed),
+	// then sweep any still-region-missing reports (geoBoundaries fallback for non-COD countries).
 	if boundaries != nil {
-		go boundaries.SweepExisting(shutdownCtx)
+		go func() {
+			boundaries.EnsureCODCoverage(shutdownCtx)
+			boundaries.SweepExisting(shutdownCtx)
+		}()
 	}
 
 	errCh := make(chan error, 1)

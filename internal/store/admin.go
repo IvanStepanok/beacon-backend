@@ -79,8 +79,11 @@ func (s *Admin) ResolveAdmin(ctx context.Context, lng, lat float64) (*model.Admi
 			FROM admin_areas
 			WHERE geom IS NOT NULL
 			  AND ST_Contains(geom, ST_SetSRID(ST_MakePoint($1,$2),4326))
-			ORDER BY level DESC,
-			         (CASE source WHEN 'cod' THEN 4 WHEN 'seed' THEN 3 WHEN 'geoboundaries' THEN 2 ELSE 1 END) DESC
+			-- Authority FIRST, then depth: the deepest area of the most authoritative source wins.
+			-- (COD-AB has official P-codes but, for some countries, only to ADM2 — it must still beat
+			-- an illustrative seed ADM3, so source rank cannot be subordinate to level.)
+			ORDER BY (CASE source WHEN 'cod' THEN 4 WHEN 'seed' THEN 3 WHEN 'geoboundaries' THEN 2 ELSE 1 END) DESC,
+			         level DESC
 			LIMIT 1
 		),
 		hit AS (
@@ -150,6 +153,55 @@ func (s *Admin) ReportsMissingRegion(ctx context.Context) ([]PointRow, error) {
 			return nil, err
 		}
 		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ReportsInCountry returns every report whose point falls inside the given country (its ADM0
+// baseline polygon) — the set to RE-geocode after a higher-authority layer (COD-AB) loads, so
+// reports already tagged via geoBoundaries/seed are upgraded to official P-codes + a deeper ADM2.
+func (s *Admin) ReportsInCountry(ctx context.Context, iso3 string) ([]PointRow, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT r.id, ST_X(r.geom), ST_Y(r.geom)
+		 FROM reports r
+		 JOIN admin_areas a ON a.pcode = $1 AND a.level = 0
+		 WHERE r.geom IS NOT NULL AND ST_Contains(a.geom, r.geom)`, iso3)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PointRow
+	for rows.Next() {
+		var p PointRow
+		if err := rows.Scan(&p.ID, &p.Lng, &p.Lat); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ReportedCountries returns the distinct ISO3 codes of countries that have at least one report,
+// resolved via the Natural Earth ADM0 baseline (the canonical point→ISO3 layer) — NOT the report's
+// stamped adm0, which may be a seed/2-letter code (e.g. "TR"), not a 3-letter ISO3 ("TUR").
+func (s *Admin) ReportedCountries(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT a.iso3 FROM reports r
+		 JOIN admin_areas a ON a.level = 0 AND a.source = 'naturalearth' AND ST_Contains(a.geom, r.geom)
+		 WHERE r.geom IS NOT NULL AND a.iso3 IS NOT NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var iso3 string
+		if err := rows.Scan(&iso3); err != nil {
+			return nil, err
+		}
+		if iso3 != "" {
+			out = append(out, iso3)
+		}
 	}
 	return out, rows.Err()
 }

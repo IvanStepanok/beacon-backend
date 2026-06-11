@@ -138,9 +138,8 @@ func (l *Loader) EnsureForPoint(ctx context.Context, lng, lat float64) {
 	if err != nil || chain == nil || chain.Adm0 == nil {
 		return
 	}
-	if chain.Adm1 != nil {
-		return // already has a region
-	}
+	// NB: no "already has a region" early-return — a report may have a geoBoundaries/seed region
+	// but still need the official COD-AB upgrade. EnsureCountry is a cheap no-op once COD is loaded.
 	if err := l.EnsureCountry(ctx, chain.Adm0.Pcode); err != nil {
 		l.log.Warn("ensure country (point) failed", "iso3", chain.Adm0.Pcode, "err", err)
 	}
@@ -171,6 +170,26 @@ func (l *Loader) SweepExisting(ctx context.Context) {
 	}
 }
 
+// EnsureCODCoverage (startup) ensures every country that has reports gets its official COD-AB
+// P-codes loaded (skipping countries already covered) — so existing reports tagged earlier via
+// geoBoundaries/seed are upgraded to authoritative, join-ready P-codes + ADM2. EnsureCountry tries
+// COD first and falls back to geoBoundaries, so non-COD countries are still covered.
+func (l *Loader) EnsureCODCoverage(ctx context.Context) {
+	countries, err := l.admin.ReportedCountries(ctx)
+	if err != nil {
+		l.log.Warn("COD coverage: list reported countries failed", "err", err)
+		return
+	}
+	for _, iso3 := range countries {
+		if n, err := l.admin.AreaCountByISO3(ctx, iso3, sourceCOD); err == nil && n > 0 {
+			continue // already has its COD layer
+		}
+		if err := l.EnsureCountry(ctx, iso3); err != nil {
+			l.log.Warn("COD coverage: ensure country failed", "iso3", iso3, "err", err)
+		}
+	}
+}
+
 // EnsureCountry fetches geoBoundaries ADM1 for a country (once) and re-geocodes
 // reports that can now be tagged with a region.
 func (l *Loader) EnsureCountry(ctx context.Context, iso3 string) error {
@@ -190,6 +209,20 @@ func (l *Loader) EnsureCountry(ctx context.Context, iso3 string) error {
 		delete(l.inflight, iso3)
 		l.mu.Unlock()
 	}()
+
+	// Prefer official OCHA COD-AB P-codes (ADM1 + ADM2); ResolveAdmin ranks 'cod' highest, so a
+	// covered country's reports get authoritative, join-ready P-codes. Only fall back to
+	// geoBoundaries (ADM1 names + shapeIDs) when the country isn't published as a COD.
+	if n, err := l.ensureCOD(ctx, iso3); err != nil {
+		l.log.Warn("COD-AB load failed; falling back to geoBoundaries", "iso3", iso3, "err", err)
+	} else if n > 0 {
+		l.regeocodeCountry(ctx, iso3) // freshly loaded → upgrade ALL the country's reports to official P-codes + ADM2
+		return nil
+	}
+	// COD already present (loaded earlier) → done; do NOT also fetch geoBoundaries.
+	if c, err := l.admin.AreaCountByISO3(ctx, iso3, sourceCOD); err == nil && c > 0 {
+		return nil
+	}
 
 	if n, err := l.admin.AreaCountByISO3(ctx, iso3, sourceGB); err == nil && n > 0 {
 		return nil // already loaded
@@ -235,6 +268,32 @@ func (l *Loader) EnsureCountry(ctx context.Context, iso3 string) error {
 }
 
 // ── internals ──────────────────────────────────────────────────────────
+
+// regeocodeCountry re-resolves EVERY report in a country and re-stamps its admin chain — used
+// after a COD-AB load so reports already tagged via geoBoundaries/seed upgrade to the official
+// P-codes (and gain ADM2). Unlike regeocodeMissing, it updates reports that already have a region.
+func (l *Loader) regeocodeCountry(ctx context.Context, iso3 string) {
+	pts, err := l.admin.ReportsInCountry(ctx, iso3)
+	if err != nil {
+		l.log.Warn("COD re-geocode: list failed", "iso3", iso3, "err", err)
+		return
+	}
+	fixed := 0
+	for _, p := range pts {
+		chain, err := l.admin.ResolveAdmin(ctx, p.Lng, p.Lat)
+		if err != nil || chain == nil {
+			continue
+		}
+		if err := l.admin.UpdateReportAdmin(ctx, p.ID, chain); err != nil {
+			l.log.Warn("COD re-geocode: update failed", "report", p.ID, "err", err)
+			continue
+		}
+		fixed++
+	}
+	if fixed > 0 {
+		l.log.Info("re-geocoded reports to COD-AB P-codes", "iso3", iso3, "count", fixed)
+	}
+}
 
 func (l *Loader) regeocodeMissing(ctx context.Context) {
 	pts, err := l.admin.ReportsMissingRegion(ctx)
