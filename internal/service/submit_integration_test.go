@@ -370,3 +370,67 @@ func TestUpdateVerification_PhotoGate(t *testing.T) {
 		t.Errorf("with-photo audit = (n=%d forced=%v), want (1, false)", n, forced)
 	}
 }
+
+// TestWithdrawReport locks the reporter-initiated takedown (data-subject erasure):
+// only the creating device may withdraw (a stranger gets Owned=false and the report
+// survives untouched); the owner's withdrawal ERASES the row entirely (count→0) and
+// records a non-PII accountability row; an unknown id is Found=false. The handler maps
+// these to 403 / 200 / 404 (see handler.WithdrawReport).
+func TestWithdrawReport(t *testing.T) {
+	pool := testDB(t)
+	svc, reports, crises := testService(pool)
+	cid, lat, lng := newTestCrisis(t, pool, crises)
+	ctx := context.Background()
+
+	id := fmt.Sprintf("wd-it-%d", time.Now().UnixNano())
+	// deviceA is the reporter's X-Device-Id (submitters.anonymous_id); the report stores
+	// the RESOLVED submitter uuid, so the handler/Submit takes the uuid, while withdraw
+	// authorizes against the anonymous_id (mirrors the live HTTP flow).
+	deviceA := fmt.Sprintf("wd-dev-A-%d", time.Now().UnixNano())
+	sidA, err := crises.ResolveSubmitterID(ctx, deviceA)
+	if err != nil {
+		t.Fatalf("resolve submitter: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM report_withdrawals WHERE report_id = $1", id)
+		_, _ = pool.Exec(ctx, "DELETE FROM reports WHERE id = $1", id)
+		_, _ = pool.Exec(ctx, "DELETE FROM submitters WHERE anonymous_id = $1", deviceA)
+	})
+
+	if _, created, err := svc.Submit(ctx, submitReq(id, cid, lat, lng, time.Now().UTC()), &sidA); err != nil || !created {
+		t.Fatalf("submit: created=%v err=%v", created, err)
+	}
+
+	count := func() int {
+		var n int
+		_ = pool.QueryRow(ctx, "SELECT count(*) FROM reports WHERE id = $1", id).Scan(&n)
+		return n
+	}
+
+	// A stranger cannot withdraw: Owned=false, and the report survives untouched.
+	if out, err := reports.WithdrawReport(ctx, id, "wd-stranger"); err != nil || !out.Found || out.Owned {
+		t.Fatalf("stranger withdraw = %+v (err=%v), want Found=true Owned=false", out, err)
+	}
+	if count() != 1 {
+		t.Fatalf("a stranger's withdraw must NOT erase the report")
+	}
+
+	// The creating device erases it.
+	if out, err := reports.WithdrawReport(ctx, id, deviceA); err != nil || !out.Found || !out.Owned {
+		t.Fatalf("owner withdraw = %+v (err=%v), want Found=true Owned=true", out, err)
+	}
+	if count() != 0 {
+		t.Fatalf("owner withdraw must ERASE the report row (got %d)", count())
+	}
+	// Accountability: a non-PII record of the erasure is kept.
+	var audits int
+	_ = pool.QueryRow(ctx, "SELECT count(*) FROM report_withdrawals WHERE report_id = $1", id).Scan(&audits)
+	if audits != 1 {
+		t.Errorf("report_withdrawals rows = %d, want 1", audits)
+	}
+
+	// An unknown id is Found=false (HTTP 404), never an error.
+	if out, err := reports.WithdrawReport(ctx, "wd-does-not-exist", deviceA); err != nil || out.Found {
+		t.Errorf("withdraw unknown id = %+v (err=%v), want Found=false", out, err)
+	}
+}

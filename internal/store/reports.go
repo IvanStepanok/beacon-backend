@@ -424,6 +424,60 @@ func (s *Reports) PhotoUploadInfo(ctx context.Context, id string) (PhotoUploadAu
 	return a, nil
 }
 
+// WithdrawOutcome reports the result of a reporter-initiated takedown.
+type WithdrawOutcome struct {
+	Found    bool
+	Owned    bool    // the caller's device matches the report's creating device
+	PhotoURL *string // set when a photo was attached, so the handler can erase the file too
+}
+
+// WithdrawReport ERASES a report at its reporter's request (data-subject takedown). In
+// one transaction it verifies the caller is the creating device (submitters.anonymous_id),
+// nulls any inbound supersedes references (the self-FK has no ON DELETE), deletes the
+// report (the verification-audit rows cascade), and records a NON-PII row in
+// report_withdrawals for accountability. The report is truly erased — it vanishes from
+// every read path. callerDevice is the caller's X-Device-Id. Returns Found=false (→404)
+// or Owned=false (→403) WITHOUT mutating anything; a report with no recorded device can
+// never be proven-owned, so it is never withdrawable anonymously.
+func (s *Reports) WithdrawReport(ctx context.Context, id, callerDevice string) (WithdrawOutcome, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return WithdrawOutcome{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var dev, photoURL, submitterID *string
+	var crisisID string
+	err = tx.QueryRow(ctx, `
+		SELECT (SELECT anonymous_id FROM submitters s WHERE s.id = r.submitter_id),
+		       r.photo_url, r.submitter_id::text, COALESCE(r.crisis_id, '')
+		FROM reports r WHERE r.id = $1 FOR UPDATE`, id).Scan(&dev, &photoURL, &submitterID, &crisisID)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return WithdrawOutcome{Found: false}, nil
+		}
+		return WithdrawOutcome{}, err
+	}
+	if dev == nil || *dev == "" || callerDevice == "" || callerDevice != *dev {
+		return WithdrawOutcome{Found: true, Owned: false}, nil
+	}
+	if _, err = tx.Exec(ctx, "UPDATE reports SET supersedes_report_id = NULL WHERE supersedes_report_id = $1", id); err != nil {
+		return WithdrawOutcome{}, err
+	}
+	if _, err = tx.Exec(ctx, "DELETE FROM reports WHERE id = $1", id); err != nil {
+		return WithdrawOutcome{}, err
+	}
+	if _, err = tx.Exec(ctx,
+		"INSERT INTO report_withdrawals (report_id, submitter_id, crisis_id) VALUES ($1, $2::uuid, NULLIF($3, ''))",
+		id, submitterID, crisisID); err != nil {
+		return WithdrawOutcome{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return WithdrawOutcome{}, err
+	}
+	return WithdrawOutcome{Found: true, Owned: true, PhotoURL: photoURL}, nil
+}
+
 // LatestPerBuilding returns one report per building (max captured_at) plus all
 // building-less reports, sorted newest first — the map-pin set. Scoping is by
 // crisis (when crisisID != "") AND/OR viewport bbox — so a location-first client
