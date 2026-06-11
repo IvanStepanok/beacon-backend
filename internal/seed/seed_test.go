@@ -5,8 +5,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/stepanok/beacon-server/internal/model"
 )
 
 // TestSeedParity locks the distributions to the dashboard/mobile dataset. If the
@@ -37,8 +35,8 @@ func TestSeedParity(t *testing.T) {
 		if r.ID == "" || r.IdempotencyKey != "idem-"+r.ID {
 			t.Errorf("bad id/idempotency: %q / %q", r.ID, r.IdempotencyKey)
 		}
-		if model.DamageOrder[r.Damage] == 0 && r.Damage != "none" {
-			t.Errorf("unknown damage grade %q", r.Damage)
+		if r.Damage != "minimal" && r.Damage != "partial" && r.Damage != "complete" {
+			t.Errorf("unknown damage tier %q (must be a 3-tier value)", r.Damage)
 		}
 		// Relative window: every capture sits after the crisis start and before
 		// base, and reaches the server (created_at) after it was captured.
@@ -49,12 +47,15 @@ func TestSeedParity(t *testing.T) {
 			t.Errorf("report %s: createdAt %v before capturedAt %v", r.ID, r.CreatedAt, r.CapturedAt)
 		}
 	}
-	t.Logf("damage(5)=%v synced=%d possibly=%d", dmg, synced, possibly)
+	t.Logf("damage(3)=%v synced=%d possibly=%d", dmg, synced, possibly)
 
-	// 5-level distribution must sum to 56 and span the EMS-98 grades.
-	sum := dmg["none"] + dmg["slight"] + dmg["moderate"] + dmg["severe"] + dmg["destroyed"]
+	// 3-tier distribution must sum to 56 and span the mandated tiers.
+	sum := dmg["minimal"] + dmg["partial"] + dmg["complete"]
 	if sum != 56 {
 		t.Errorf("damage buckets sum = %d, want 56 (%v)", sum, dmg)
+	}
+	if dmg["minimal"] == 0 || dmg["partial"] == 0 || dmg["complete"] == 0 {
+		t.Errorf("damage distribution must span all 3 tiers, got %v", dmg)
 	}
 	// verification + synced are independent of the damage scale change → unchanged.
 	if ver["verified"] != 19 || ver["pending"] != 28 || ver["flagged"] != 9 {
@@ -174,8 +175,8 @@ func TestSeedModular(t *testing.T) {
 				t.Errorf("report %s: pressingNeed %q not in C1 enum", r.ID, n)
 			}
 		}
-		// Plausibility: severe/destroyed damage never reports fully-functional health.
-		if (r.Damage == "severe" || r.Damage == "destroyed") && m.HealthServices == "fully_functional" {
+		// Plausibility: partial/complete damage never reports fully-functional health.
+		if (r.Damage == "partial" || r.Damage == "complete") && m.HealthServices == "fully_functional" {
 			t.Errorf("report %s: damage %q with fully_functional health is implausible", r.ID, r.Damage)
 		}
 	}

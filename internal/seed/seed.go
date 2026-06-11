@@ -1,10 +1,10 @@
 // Package seed deterministically reproduces the Antakya dataset using the same
 // sin-hash rnd(seed)/pick() as the dashboard mock (ported to Go; math.Floor(rnd*N)
-// absorbs the sub-ULP gap between Go math.Sin and JS Math.sin). Stable across the
-// 5-level migration: verification 19/28/9, synced 37, ids 1156..1211 are unchanged.
-// The damage scale is now 5-level EMS-98 (none:12/slight:17/moderate:11/severe:6/
-// destroyed:10) — the dashboard mock will be re-pointed at this contract when the
-// clients are wired to the live API. Runs only on an empty reports table (idempotent).
+// absorbs the sub-ULP gap between Go math.Sin and JS Math.sin). Verification
+// 19/28/9, synced 37, ids 1156..1211 are unchanged. The damage scale is the
+// mandated 3-tier classification (minimal/partial/complete); the rnd(fi+100) draw
+// maps to 3 buckets instead of 5, so only the damage distribution changes — every
+// other golden draw is untouched. Runs only on an empty reports table (idempotent).
 //
 // All timestamps are RELATIVE to seed time (crisis started seedCrisisWindow ago,
 // captures spread deterministically across it) so the demo reads as a live
@@ -96,27 +96,20 @@ var (
 		"Cumhuriyet Mh.", "Ulus Mh.", "Yeni Mahalle", "Kanatlı Cd.", "Köprübaşı", "Harbiye Yolu",
 	}
 	infra  = []string{"residential", "commercial", "government", "utility", "transport", "community", "public"}
-	damage = []string{"none", "slight", "moderate", "severe", "destroyed"} // EMS-98 5-level
+	damage = []string{"minimal", "partial", "complete"} // mandated 3-tier classification
 	verif  = []string{"verified", "pending", "pending", "verified", "flagged", "pending"}
 	debris = []string{"no", "no", "yes", "unsure"}
 
 	descriptions = map[string][]model.ReportDescription{
-		"none": {
+		"minimal": {
 			{Original: "Bina sağlam, sadece toz ve cam kırıkları.", OriginalLang: "tr", Translated: "Building intact, only dust and broken glass."},
-		},
-		"slight": {
 			{Original: "Cephe çatlakları görünüyor, çatı sağlam.", OriginalLang: "tr", Translated: "Facade cracks visible, roof intact."},
-			{Original: "Hafif hasar, bina hâlâ kullanılabilir.", OriginalLang: "tr", Translated: "Minor damage, the building is still usable."},
 		},
-		"moderate": {
+		"partial": {
 			{Original: "Taşıyıcı olmayan duvarlarda çatlaklar, dikkatli girilmeli.", OriginalLang: "tr", Translated: "Cracks in non-load-bearing walls, enter with caution."},
-			{Original: "Orta düzey hasar, kısmi kullanım mümkün.", OriginalLang: "tr", Translated: "Moderate damage, partial use possible."},
-		},
-		"severe": {
 			{Original: "Üst katlarda ciddi hasar var, giriş riskli.", OriginalLang: "tr", Translated: "Serious damage on the upper floors, entry is risky."},
-			{Original: "Duvarlar çatladı, bina tahliye edildi.", OriginalLang: "tr", Translated: "Walls have cracked, the building was evacuated."},
 		},
-		"destroyed": {
+		"complete": {
 			{Original: "Bina tamamen çökmüş, kimse giremiyor.", OriginalLang: "tr", Translated: "Building has fully collapsed, no access."},
 			{Original: "Enkaz altında insan olabilir, ekip lazım.", OriginalLang: "tr", Translated: "People may be trapped under the rubble, a team is needed."},
 		},
@@ -156,23 +149,15 @@ type modularSeed struct {
 // not_functioning|unknown, pressingNeeds ⊆ {food_water,cash,healthcare,shelter,
 // livelihoods,wash,protection,local_support,other}.
 var modularVariants = map[string][2]modularSeed{
-	"none": {
+	"minimal": {
 		{"none_observed", "fully_functional", []string{"local_support"}},
-		{"unknown", "unknown", []string{"other"}},
-	},
-	"slight": {
-		{"minor", "fully_functional", []string{"cash"}},
-		{"none_observed", "partially_functional", []string{"livelihoods"}},
-	},
-	"moderate": {
-		{"moderate", "partially_functional", []string{"food_water", "wash"}},
 		{"minor", "partially_functional", []string{"cash", "livelihoods"}},
 	},
-	"severe": {
+	"partial": {
+		{"moderate", "partially_functional", []string{"food_water", "wash"}},
 		{"severe", "largely_disrupted", []string{"shelter", "food_water"}},
-		{"severe", "not_functioning", []string{"shelter", "healthcare", "wash"}},
 	},
-	"destroyed": {
+	"complete": {
 		{"destroyed", "not_functioning", []string{"shelter", "healthcare", "food_water"}},
 		{"destroyed", "not_functioning", []string{"shelter", "protection", "healthcare"}},
 	},
@@ -204,7 +189,7 @@ func BuildReports(base time.Time) []model.Report {
 	out := make([]model.Report, 0, 56)
 	for i := 0; i < 56; i++ {
 		fi := float64(i)
-		dmg := damage[int(math.Floor(rnd(fi+100)*5))%5]
+		dmg := damage[int(math.Floor(rnd(fi+100)*3))%3]
 		possibly := rnd(fi+900) > 0.82 // ~18% flagged "possibly damaged" (reporter unsure)
 		lat := antakyaLat + (rnd(fi)-0.5)*0.05
 		lng := antakyaLng + (rnd(fi+50)-0.5)*0.05
@@ -417,8 +402,8 @@ func Run(ctx context.Context, pool *pgxpool.Pool, reports *store.Reports, crises
 }
 
 // buildVersionChain creates a 3-version history for one tapped footprint to
-// demonstrate the per-building timeline (mobile scenario): slight ~2 days ago,
-// severe ~1 day ago, destroyed ~2 hours ago — a deterioration spanning the
+// demonstrate the per-building timeline (mobile scenario): minimal ~2 days ago,
+// partial ~1 day ago, complete ~2 hours ago — a deterioration spanning the
 // crisis window. A version chain only exists for a REAL footprint (re-reporting
 // one is the chain's job), so each entry carries the fp- id + buildingSource.
 // Sizes start 0 — assignSeedPhotos attaches the real evidence.
@@ -443,10 +428,10 @@ func buildVersionChain(base time.Time) []model.Report {
 			CreatedAt:  captured.Add(5 * time.Minute), UpdatedAt: captured.Add(5 * time.Minute),
 		}
 	}
-	v1 := mk(1, "slight", 2880, nil)
+	v1 := mk(1, "minimal", 2880, nil)
 	id1 := v1.ID
-	v2 := mk(2, "severe", 1440, &id1)
+	v2 := mk(2, "partial", 1440, &id1)
 	id2 := v2.ID
-	v3 := mk(3, "destroyed", 120, &id2)
+	v3 := mk(3, "complete", 120, &id2)
 	return []model.Report{v1, v2, v3}
 }

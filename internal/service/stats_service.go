@@ -21,7 +21,7 @@ func pct(n, total int) int {
 
 // Overview assembles the dashboard's overview entirely from SQL aggregates.
 func (s *StatsService) Overview(ctx context.Context, crisisID string) (*model.StatsOverview, error) {
-	total, dmg, tier, ver, synced, err := s.reports.StatsCounts(ctx, crisisID)
+	total, tier, ver, synced, err := s.reports.StatsCounts(ctx, crisisID)
 	if err != nil {
 		return nil, err
 	}
@@ -41,15 +41,12 @@ func (s *StatsService) Overview(ctx context.Context, crisisID string) (*model.St
 	if err != nil {
 		return nil, err
 	}
-	// Headline damage percentages are computed off the CANONICAL tier rollup so they
-	// stay correct under either capture scale (the global default is tier3, whose
-	// reports never appear in the 5-level dmg.* counts). complete == EMS-98 destroyed
-	// + tier-3 complete; partial+complete == the "heavy damage" headline.
+	// Headline damage percentages off the canonical tier rollup. complete == the
+	// complete tier; partial+complete == the "heavy damage" headline.
 	completePct := pct(tier.Complete, total)
 	return &model.StatsOverview{
 		TotalReports:       total,
 		DamageTierCounts:   tier,
-		DamageCounts:       dmg,
 		VerificationCounts: ver,
 		SyncedCount:        synced,
 		SyncedPct:          pct(synced, total),

@@ -9,10 +9,11 @@ import (
 
 // TestSubmitValidation locks the submit gate (normalize → validate), table-
 // driven over the same lenient inbound shape both clients POST. A submission
-// needs an id, a damage grade from either vocabulary, at least one infrastructure
-// type, a crisis nature, and EITHER a resolved point OR a landmark; every enum
-// field is closed (bad values are 400s, never silently stored). No DB — these are
-// the pure pre-storage gates.
+// needs an id, a damage value from the mandated 3-tier classification, at least
+// one infrastructure type, a crisis nature, and EITHER a resolved point OR a
+// landmark; every enum field is closed (bad values are 400s, never silently
+// stored — the retired 5-level EMS-98 grades are now rejected). No DB — these
+// are the pure pre-storage gates.
 func TestSubmitValidation(t *testing.T) {
 	// ok is a minimal valid request; each case mutates a copy.
 	ok := func() model.SubmitReportRequest {
@@ -24,8 +25,9 @@ func TestSubmitValidation(t *testing.T) {
 		mutate  func(*model.SubmitReportRequest)
 		wantErr string // substring of the ValidationError; "" = must pass
 	}{
-		{"valid 3-tier", func(r *model.SubmitReportRequest) {}, ""},
-		{"valid 5-level", func(r *model.SubmitReportRequest) { r.Damage = "severe" }, ""},
+		{"valid minimal tier", func(r *model.SubmitReportRequest) { r.Damage = "minimal" }, ""},
+		{"valid complete tier", func(r *model.SubmitReportRequest) { r.Damage = "complete" }, ""},
+		{"retired 5-level rejected", func(r *model.SubmitReportRequest) { r.Damage = "severe" }, "damage must be one of"},
 		{"missing id", func(r *model.SubmitReportRequest) { r.ID = "" }, "id is required"},
 		{"missing damage", func(r *model.SubmitReportRequest) { r.Damage = "" }, "damage must be one of"},
 		{"bad damage enum", func(r *model.SubmitReportRequest) { r.Damage = "catastrophic" }, "damage must be one of"},
@@ -35,7 +37,7 @@ func TestSubmitValidation(t *testing.T) {
 		{"bad crisisNature", func(r *model.SubmitReportRequest) { r.CrisisNature = []string{"meteor"} }, "invalid crisisNature"},
 		{"missing crisisNature", func(r *model.SubmitReportRequest) { r.CrisisNature = nil }, "crisis nature is required"},
 		{"bad cluster", func(r *model.SubmitReportRequest) { r.Clusters = []string{"shelter"} }, "invalid cluster"},
-		{"bad aiLevel", func(r *model.SubmitReportRequest) { r.AILevel = strPtr2("totaled") }, "aiLevel must be a damage level"},
+		{"bad aiLevel", func(r *model.SubmitReportRequest) { r.AILevel = strPtr2("totaled") }, "aiLevel must be a damage tier"},
 		{"lat out of range", func(r *model.SubmitReportRequest) { r.Lat = f64(95) }, "lat/lng out of range"},
 		{"lng out of range", func(r *model.SubmitReportRequest) { r.Lng = f64(181) }, "lat/lng out of range"},
 		// Location-or-landmark: no coords and no landmark is rejected; a landmark

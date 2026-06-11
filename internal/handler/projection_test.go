@@ -16,7 +16,7 @@ func fullReport() model.Report {
 	conf := 91
 	return model.Report{
 		ID: "1156", IdempotencyKey: "idem-1156", CrisisID: "crisis-antakya",
-		SubmitterID: sptr("d1b2c3"), Damage: "severe", DamageTier: "partial",
+		SubmitterID: sptr("d1b2c3"), Damage: "partial", DamageTier: "partial",
 		Verification: "verified", Debris: "yes",
 		InfraTypes: []string{"residential"}, InfraName: sptr("Cumhuriyet Primary School"),
 		CrisisNature: []string{"earthquake"},
@@ -33,7 +33,7 @@ func fullReport() model.Report {
 			Landmark: sptr("opposite the bakery"), GPSAccuracyMeters: fptr(4.2),
 		},
 		Description: &model.ReportDescription{Original: "Duvarlar çatladı", OriginalLang: "tr", Translated: "Walls cracked"},
-		AILevel:     sptr("severe"), AIConfidence: &conf,
+		AILevel:     sptr("partial"), AIConfidence: &conf,
 		Modular:       json.RawMessage(`{"electricity":"severe"}`),
 		Anonymization: model.DefaultAnonymization(),
 		Clusters:      []string{"slsc"},
@@ -90,7 +90,7 @@ func TestPublicProjection_Coarsening(t *testing.T) {
 	}
 
 	// What a public damage map legitimately needs is KEPT.
-	if pub.Damage != "severe" || pub.DamageTier != "partial" || pub.Verification != "verified" || pub.Place != "Saray Cd." {
+	if pub.Damage != "partial" || pub.DamageTier != "partial" || pub.Verification != "verified" || pub.Place != "Saray Cd." {
 		t.Errorf("public fields lost: %q %q %q %q", pub.Damage, pub.DamageTier, pub.Verification, pub.Place)
 	}
 	// photoUrl survives ONLY on a verified report (asserted unverified below).

@@ -104,7 +104,7 @@ func newTestSubmitter(t *testing.T, pool *pgxpool.Pool, crises *store.Crises) st
 // submitReq builds a minimal valid pinned submission at the given point.
 func submitReq(id, crisisID string, lat, lng float64, capturedAt time.Time) model.SubmitReportRequest {
 	return model.SubmitReportRequest{
-		ID: id, CrisisID: crisisID, Damage: "severe",
+		ID: id, CrisisID: crisisID, Damage: "partial",
 		InfraTypes: []string{"residential"}, CrisisNature: []string{"earthquake"},
 		Lat: f64(lat), Lng: f64(lng), CapturedAt: &capturedAt,
 	}
@@ -200,8 +200,8 @@ func TestSubmit_BuildingVersionChain(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT current_damage FROM buildings WHERE id = $1", bid).Scan(&current); err != nil {
 		t.Fatalf("building row: %v", err)
 	}
-	if current != "severe" {
-		t.Errorf("building current_damage = %q, want severe", current)
+	if current != "partial" {
+		t.Errorf("building current_damage = %q, want partial", current)
 	}
 }
 

@@ -297,8 +297,8 @@ func validate(r model.Report) error {
 	if r.ID == "" {
 		return ValidationError{"id is required (client-supplied for idempotency)"}
 	}
-	if !contains(model.DamageValuesAll, r.Damage) {
-		return ValidationError{fmt.Sprintf("damage must be one of %v", model.DamageValuesAll)}
+	if !contains(model.DamageTiers, r.Damage) {
+		return ValidationError{fmt.Sprintf("damage must be one of %v", model.DamageTiers)}
 	}
 	if !contains(model.DebrisStates, r.Debris) {
 		return ValidationError{fmt.Sprintf("debris must be one of %v", model.DebrisStates)}
@@ -324,8 +324,8 @@ func validate(r model.Report) error {
 			return ValidationError{fmt.Sprintf("invalid crisisNature %q", cn)}
 		}
 	}
-	if r.AILevel != nil && !contains(model.DamageValuesAll, *r.AILevel) {
-		return ValidationError{"aiLevel must be a damage level"}
+	if r.AILevel != nil && !contains(model.DamageTiers, *r.AILevel) {
+		return ValidationError{"aiLevel must be a damage tier"}
 	}
 	for _, c := range r.Clusters {
 		if !contains(model.Clusters, c) {

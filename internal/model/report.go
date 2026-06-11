@@ -9,10 +9,10 @@ import (
 	"time"
 )
 
-// Enum wire values are LOWERCASE (matches the export contract both clients already use).
-// Damage is a 5-level ordinal grade aligned to EMS-98 / Copernicus EMS / UNOSAT.
+// Enum wire values are LOWERCASE (matches the export contract both clients use).
+// Damage is the challenge's MANDATED 3-tier classification (minimal/partial/complete) —
+// the community-facing rollup of the Copernicus EMS / UNOSAT damage grades.
 var (
-	DamageLevels  = []string{"none", "slight", "moderate", "severe", "destroyed"}
 	DamageTiers   = []string{"minimal", "partial", "complete"} // challenge's required 3-level core indicator
 	Verifications = []string{"pending", "verified", "flagged"}
 	DebrisStates  = []string{"yes", "no", "unsure"}
@@ -20,30 +20,16 @@ var (
 	CrisisNatures = []string{"earthquake", "flood", "tsunami", "hurricane", "wildfire", "explosion", "chemical", "conflict", "civil_unrest"}
 )
 
-// DamageValuesAll = both vocabularies (5-level EMS-98 + 3-tier). A report's damage
-// may be either, depending on the global capture scale; the server accepts both.
-var DamageValuesAll = append(append([]string{}, DamageLevels...), DamageTiers...)
-
-// DamageOrder ranks the 5-level grade for "worst"/escalation computation. It does
-// NOT cover the 3-tier vocabulary (minimal/partial/complete) — a 'partial' report
-// is NOT in this map and would rank 0 (== 'none'). For any "worst"/ranking that may
-// see EITHER vocabulary (the global default scale is tier3), rank by TierOrder on
-// the rollup tier instead, never by DamageOrder on the raw grade. See TierRank.
-var DamageOrder = map[string]int{"none": 0, "slight": 1, "moderate": 2, "severe": 3, "destroyed": 4}
-
-// TierOrder ranks the required 3-tier classification (minimal < partial < complete)
-// for vocabulary-agnostic "worst" / escalation computation.
+// TierOrder ranks the 3-tier classification (minimal < partial < complete) for
+// "worst" / escalation computation.
 var TierOrder = map[string]int{"minimal": 0, "partial": 1, "complete": 2}
 
-// RollupTier maps either vocabulary to the required 3-tier classification.
+// RollupTier normalizes a damage value to the required 3-tier classification.
+// Damage is 3-tier end-to-end now; an unrecognized value defaults to minimal.
 func RollupTier(damage string) string {
 	switch damage {
-	case "none", "slight", "minimal":
-		return "minimal"
-	case "moderate", "severe", "partial":
-		return "partial"
-	case "destroyed", "complete":
-		return "complete"
+	case "minimal", "partial", "complete":
+		return damage
 	default:
 		return "minimal"
 	}
@@ -118,8 +104,8 @@ type Report struct {
 	CrisisID       string  `json:"crisisId"`
 	SubmitterID    *string `json:"submitterId,omitempty"`
 
-	Damage          string `json:"damage"`          // raw grade (3-tier OR 5-level EMS-98)
-	DamageTier      string `json:"damageTier"`      // required 3-level rollup (minimal|partial|complete), always present
+	Damage          string `json:"damage"`          // mandated 3-tier classification (minimal|partial|complete)
+	DamageTier      string `json:"damageTier"`      // generated rollup alias of Damage (kept for export/stat joins)
 	PossiblyDamaged bool   `json:"possiblyDamaged"` // reporter unsure / resolves satellite "possibly damaged" class
 	Verification    string `json:"verification"`
 	Debris          string `json:"debris"`

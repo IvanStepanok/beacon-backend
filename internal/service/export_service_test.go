@@ -20,7 +20,7 @@ func f64(v float64) *float64 { return &v }
 func fixtureResolved() model.Report {
 	return model.Report{
 		ID:               "r-1",
-		Damage:           "severe",
+		Damage:           "partial",
 		DamageTier:       "partial",
 		InfraTypes:       []string{"residential"},
 		InfraName:        strPtr("Cumhuriyet Primary School"),

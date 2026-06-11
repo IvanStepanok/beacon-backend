@@ -87,21 +87,9 @@ type PointsRequest struct {
 
 // ── stats/overview (computed entirely in SQL) ──────────────────────────
 
-// DamageCounts is the 5-level EMS-98 detail breakdown. These counts ONLY cover
-// reports captured on the ems98 scale; when the global scale is tier3 (the default)
-// most reports land in DamageTierCounts instead, so these 5 fields do NOT sum to
-// TotalReports. Use DamageTierCounts for the canonical, always-complete breakdown.
-type DamageCounts struct {
-	None      int `json:"none"`
-	Slight    int `json:"slight"`
-	Moderate  int `json:"moderate"`
-	Severe    int `json:"severe"`
-	Destroyed int `json:"destroyed"`
-}
-
-// DamageTierCounts is the CANONICAL, vocabulary-agnostic damage breakdown: every
-// report (both scales) rolls into exactly one tier, so Minimal+Partial+Complete
-// always equals TotalReports. This is the breakdown clients should chart by default.
+// DamageTierCounts is the canonical damage breakdown: every report rolls into
+// exactly one of the 3 mandated tiers, so Minimal+Partial+Complete always equals
+// TotalReports. This is the breakdown clients chart.
 type DamageTierCounts struct {
 	Minimal  int `json:"minimal"`
 	Partial  int `json:"partial"`
@@ -124,17 +112,13 @@ type TimeBucket struct {
 
 type StatsOverview struct {
 	TotalReports int `json:"totalReports"`
-	// DamageTierCounts is the canonical breakdown (sums to TotalReports). DamageCounts
-	// is the 5-level EMS-98 detail (only ems98-scale reports; does NOT sum to total).
+	// DamageTierCounts is the canonical breakdown (Minimal+Partial+Complete == TotalReports).
 	DamageTierCounts   DamageTierCounts   `json:"damageTierCounts"`
-	DamageCounts       DamageCounts       `json:"damageCounts"`
 	VerificationCounts VerificationCounts `json:"verificationCounts"`
 	SyncedCount        int                `json:"syncedCount"`
 	SyncedPct          int                `json:"syncedPct"`
-	// Headline damage percentages are computed off the CANONICAL tier rollup so they
-	// stay correct under either capture scale. CompletePct = complete tier (the
-	// tier-3 'complete' / EMS-98 'destroyed'). SeverePlusPct = partial+complete tiers
-	// (the "heavy damage" headline: EMS-98 moderate/severe/destroyed + tier-3 partial/complete).
+	// Headline damage percentages off the tier rollup. CompletePct = the complete tier;
+	// SeverePlusPct = partial+complete (the "heavy damage" headline).
 	CompletePct   int `json:"completePct"`
 	DestroyedPct  int `json:"destroyedPct"` // alias of completePct (kept for dashboard compatibility)
 	SeverePlusPct int `json:"severePlusPct"`

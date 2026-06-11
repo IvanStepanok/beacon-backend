@@ -7,29 +7,22 @@ import (
 	"github.com/stepanok/beacon-server/internal/model"
 )
 
-// StatsCounts returns totals + damage counts (BOTH the canonical 3-tier rollup and
-// the 5-level EMS-98 detail) + verification/synced counts in one row. The tier
-// counts (minimal/partial/complete) are computed off the generated damage_tier
-// column so every report — on either capture scale — is counted; tier3-scale
-// reports are NEVER silently dropped. tierMin+tierPart+tierComp == total.
-func (s *Reports) StatsCounts(ctx context.Context, crisisID string) (total int, dmg model.DamageCounts, tier model.DamageTierCounts, ver model.VerificationCounts, synced int, err error) {
+// StatsCounts returns totals + the canonical 3-tier damage breakdown + verification/
+// synced counts in one row. The tier counts (minimal/partial/complete) are computed
+// off the generated damage_tier column, so every report is counted exactly once and
+// tierMin+tierPart+tierComp == total.
+func (s *Reports) StatsCounts(ctx context.Context, crisisID string) (total int, tier model.DamageTierCounts, ver model.VerificationCounts, synced int, err error) {
 	err = s.pool.QueryRow(ctx, `
 		SELECT count(*),
 		       count(*) FILTER (WHERE damage_tier='minimal'),
 		       count(*) FILTER (WHERE damage_tier='partial'),
 		       count(*) FILTER (WHERE damage_tier='complete'),
-		       count(*) FILTER (WHERE damage='none'),
-		       count(*) FILTER (WHERE damage='slight'),
-		       count(*) FILTER (WHERE damage='moderate'),
-		       count(*) FILTER (WHERE damage='severe'),
-		       count(*) FILTER (WHERE damage='destroyed'),
 		       count(*) FILTER (WHERE verification='verified'),
 		       count(*) FILTER (WHERE verification='pending'),
 		       count(*) FILTER (WHERE verification='flagged'),
 		       count(*) FILTER (WHERE synced)
 		FROM reports WHERE crisis_id = $1`, crisisID).
 		Scan(&total, &tier.Minimal, &tier.Partial, &tier.Complete,
-			&dmg.None, &dmg.Slight, &dmg.Moderate, &dmg.Severe, &dmg.Destroyed,
 			&ver.Verified, &ver.Pending, &ver.Flagged, &synced)
 	return
 }

@@ -80,10 +80,6 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, h *handler.Handlers, logge
 		// scalable vector tiles (clusters at low zoom, points at high zoom)
 		r.Get("/tiles/reports/{z}/{x}/{y}", h.ReportTile)
 
-		// global client config (capture scale); analyst flips it for all clients
-		r.Get("/config", h.GetConfig)
-		r.With(requireMutator).Patch("/config", h.PatchConfig)
-
 		// modular capture-form schema (public: the anonymous mobile app downloads
 		// the Appendix-1 sections, resolved with the crisis's overrides)
 		r.Get("/form-schema", h.GetFormSchema)

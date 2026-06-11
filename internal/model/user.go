@@ -59,7 +59,7 @@ var roleRank = map[string]int{
 }
 
 // CanManageGlobalConfig reports whether the user may change ORG-WIDE settings that
-// affect every client/crisis (e.g. the global damage_scale). Restricted to the
+// affect every client/crisis (the org-wide app_settings store). Restricted to the
 // senior oversight roles: Regional Bureau analyst and Crisis Bureau admin. Field
 // validators, CO analysts and external viewers are denied.
 func (u User) CanManageGlobalConfig() bool {
