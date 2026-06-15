@@ -19,7 +19,9 @@ services:
     # verifying identity, which is correct on the private 'internal' network the cert never
     # leaves. openssl ships in the postgis image. We override the entrypoint to mint the
     # cert, then hand off to the stock postgres entrypoint so initdb/startup are unchanged.
-    entrypoint: ["bash", "-lc"]
+    # NB: plain `-c` (not `-lc`): a login shell re-sources /etc/profile and drops the image's
+    # PATH, so `postgres` wouldn't be found on exec. `-c` keeps the image PATH intact.
+    entrypoint: ["bash", "-c"]
     command:
       - >
         openssl req -new -x509 -days 3650 -nodes -subj '/CN=beacon-db'
