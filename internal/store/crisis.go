@@ -23,13 +23,16 @@ const crisisSelect = `
   -- Live count, not the denormalized crises.report_count: seed inserts and the
   -- normal submit path write reports.crisis_id directly and never bump the
   -- column, so it drifts (cheap here: reports.crisis_id is indexed).
-  (SELECT count(*)::int FROM reports r WHERE r.crisis_id = crises.id) AS report_count`
+  (SELECT count(*)::int FROM reports r WHERE r.crisis_id = crises.id) AS report_count,
+  -- Distinct submitters (the corroboration signal the review queue ranks on): an
+  -- emergent cluster of 5 reports from 1 device is far weaker than 5 from 5 devices.
+  (SELECT count(DISTINCT r.submitter_id)::int FROM reports r WHERE r.crisis_id = crises.id) AS distinct_submitters`
 
 func scanCrisis(row pgx.Row) (model.Crisis, error) {
 	var c model.Crisis
 	if err := row.Scan(&c.ID, &c.Title, &c.Area, &c.Nature, &c.CenterLat, &c.CenterLng,
 		&c.Source, &c.StartedAt, &c.StartedAgoHrs, &c.Glide, &c.ResponseLevel,
-		&c.RadiusKm, &c.EndedAt, &c.Status, &c.ResponseID, &c.ReportCount); err != nil {
+		&c.RadiusKm, &c.EndedAt, &c.Status, &c.ResponseID, &c.ReportCount, &c.DistinctSubmitters); err != nil {
 		return model.Crisis{}, err
 	}
 	c.Lat, c.Lng = c.CenterLat, c.CenterLng // dashboard alias
@@ -83,7 +86,7 @@ func (s *Crises) Near(ctx context.Context, lat, lng, withinKm float64) ([]model.
 		var dist float64
 		if err := rows.Scan(&c.ID, &c.Title, &c.Area, &c.Nature, &c.CenterLat, &c.CenterLng,
 			&c.Source, &c.StartedAt, &c.StartedAgoHrs, &c.Glide, &c.ResponseLevel,
-			&c.RadiusKm, &c.EndedAt, &c.Status, &c.ResponseID, &c.ReportCount, &dist); err != nil {
+			&c.RadiusKm, &c.EndedAt, &c.Status, &c.ResponseID, &c.ReportCount, &c.DistinctSubmitters, &dist); err != nil {
 			return nil, err
 		}
 		c.Lat, c.Lng = c.CenterLat, c.CenterLng
@@ -117,41 +120,76 @@ func (s *Crises) AssignCrisis(ctx context.Context, lat, lng float64, capturedAt 
 	return id, nil
 }
 
-// Emergent-cluster tuning (configurable in production; these are sane defaults).
-const (
-	emergentRadiusKm  = 2.0
-	emergentWindowHrs = 24
-	emergentMinReport = 3
-)
+// EmergentConfig holds the (deployment-tunable) thresholds for forming an emergent
+// crisis. A new crowd cluster has no crisis row yet, so FORMATION uses these global
+// defaults (config.Config / env BEACON_EMERGENT_*); the effective values are stamped
+// onto the created crisis row for provenance and future per-crisis tuning.
+type EmergentConfig struct {
+	RadiusKm   float64 // spatial cluster radius (km)
+	WindowHrs  int     // look-back window (hours)
+	MinReports int     // minimum DISTINCT submitters required to propose a crisis
+}
 
-// DetectEmergentCrisis checks whether enough PENDING reports have clustered around
-// (lat,lng) within emergentRadiusKm over the last emergentWindowHrs. If so it
-// creates a 'proposed' crisis (source='emergent') at the cluster centroid and
-// pulls the clustered pending reports (and their buildings) into it. Returns the
-// new crisis id, or "" when no cluster formed. An analyst confirms/dismisses it.
+// DefaultEmergentConfig mirrors the historical hardcoded thresholds — used by tests
+// and as a safety fallback when config has not been threaded through.
+func DefaultEmergentConfig() EmergentConfig {
+	return EmergentConfig{RadiusKm: 2.0, WindowHrs: 24, MinReports: 3}
+}
+
+// AdminScope constrains an emergent cluster to a single admin area (so a 2 km circle
+// straddling two districts cannot merge them into one crisis). Level is the admin
+// depth (1/2/3) of the generated reports.adm{N}_pcode column to filter on; Level 0
+// means "no admin scope" — the point fell outside all known boundaries, so we fall
+// back to the pure-radius behaviour.
+type AdminScope struct {
+	Level int
+	Pcode string
+}
+
+func (a AdminScope) active() bool { return a.Level >= 1 && a.Level <= 3 && a.Pcode != "" }
+
+// DetectEmergentCrisis checks whether enough DISTINCT submitters have clustered
+// around (lat,lng) within cfg.RadiusKm over the last cfg.WindowHrs — and, when a
+// scope is given, within the SAME admin area. If so it creates a 'proposed' crisis
+// (source='emergent') at the cluster centroid and pulls the clustered pending
+// reports (and their buildings) into it. Returns the new crisis id, or "" when no
+// cluster formed. An analyst confirms (→active) or dismisses it; this NEVER
+// auto-activates — a proposed crisis stays out of the public/default scope until a
+// human confirms it.
+//
+// The threshold counts DISTINCT submitter_id (not raw rows): three reports from one
+// device can never propose a crisis. NULL-submitter (fully anonymous, no device id)
+// reports do not count toward the distinct gate.
 //
 // areaName resolves the centroid to an admin-area name (the service passes the
 // admin_areas reverse-geocode; "" / nil = unresolved). The title/area are NEVER
 // built from a report's free-text place — client placeholders like "Your location"
 // must not leak into crisis titles; the fallback is the centroid's coordinates.
-func (s *Crises) DetectEmergentCrisis(ctx context.Context, lat, lng float64, at time.Time, areaName func(ctx context.Context, lat, lng float64) string) (string, error) {
-	cutoff := at.Add(-emergentWindowHrs * time.Hour)
+func (s *Crises) DetectEmergentCrisis(ctx context.Context, lat, lng float64, at time.Time, cfg EmergentConfig, scope AdminScope, areaName func(ctx context.Context, lat, lng float64) string) (string, error) {
+	cutoff := at.Add(-time.Duration(cfg.WindowHrs) * time.Hour)
 	pt := "ST_SetSRID(ST_MakePoint($2,$1),4326)::geography"
 
-	var n int
+	where := "WHERE crisis_id IS NULL AND captured_at >= $3\n" +
+		"  AND ST_DWithin(geom::geography, " + pt + ", $4*1000.0)"
+	countArgs := []any{lat, lng, cutoff, cfg.RadiusKm}
+	if scope.active() {
+		where += fmt.Sprintf("\n  AND adm%d_pcode = $5", scope.Level)
+		countArgs = append(countArgs, scope.Pcode)
+	}
+
+	var nTotal, nDistinct int
 	var clat, clng float64
 	var earliest time.Time
 	var nature *string
-	err := s.pool.QueryRow(ctx, "SELECT count(*), COALESCE(avg(lat),0), COALESCE(avg(lng),0), COALESCE(min(captured_at), now()),\n"+
+	err := s.pool.QueryRow(ctx, "SELECT count(*), count(DISTINCT submitter_id),\n"+
+		"  COALESCE(avg(lat),0), COALESCE(avg(lng),0), COALESCE(min(captured_at), now()),\n"+
 		"  mode() WITHIN GROUP (ORDER BY (crisis_nature)[1])\n"+
-		"FROM reports\n"+
-		"WHERE crisis_id IS NULL AND captured_at >= $3\n"+
-		"  AND ST_DWithin(geom::geography, "+pt+", $4*1000.0)",
-		lat, lng, cutoff, emergentRadiusKm).Scan(&n, &clat, &clng, &earliest, &nature)
+		"FROM reports\n"+where,
+		countArgs...).Scan(&nTotal, &nDistinct, &clat, &clng, &earliest, &nature)
 	if err != nil {
 		return "", err
 	}
-	if n < emergentMinReport {
+	if nDistinct < cfg.MinReports {
 		return "", nil
 	}
 
@@ -167,21 +205,35 @@ func (s *Crises) DetectEmergentCrisis(ctx context.Context, lat, lng float64, at 
 			area = name
 		}
 	}
+	var adminPcode *string
+	if scope.active() {
+		p := scope.Pcode
+		adminPcode = &p
+	}
 
 	var newID string
-	cpt := "ST_SetSRID(ST_MakePoint($4,$3),4326)::geography" // centroid point
+	// The pull-in circle MUST use the SAME centre + radius + admin scope as the gate
+	// (count) query above — the triggering pin (lat,lng), NOT the centroid. A
+	// centroid-centred circle of the same radius is a SHIFTED set, so it could leave
+	// some gate-counted reports unattached (and the stored geom/centre still uses the
+	// centroid for display). Identical predicate ⇒ exactly the gated reports attach.
+	ppt := "ST_SetSRID(ST_MakePoint($4,$3),4326)::geography" // trigger pin ($3=lat,$4=lng)
 	txErr := RunInTx(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx,
-			"INSERT INTO crises (id, title, area, nature, geom, center_lat, center_lng, source, started_at, radius_km, status, report_count)\n"+
-				"VALUES ('emergent-' || replace(gen_random_uuid()::text,'-',''), $1, $2, $3, ST_SetSRID(ST_MakePoint($5,$4),4326), $4, $5, 'emergent', $6, $7, 'proposed', $8)\n"+
+			"INSERT INTO crises (id, title, area, nature, geom, center_lat, center_lng, source, started_at, radius_km, status, report_count, admin_pcode, emergent_radius_km, emergent_window_hrs, emergent_min_reports)\n"+
+				"VALUES ('emergent-' || replace(gen_random_uuid()::text,'-',''), $1, $2, $3, ST_SetSRID(ST_MakePoint($5,$4),4326), $4, $5, 'emergent', $6, $7, 'proposed', $8, $9, $7, $10, $11)\n"+
 				"RETURNING id",
-			title, area, nat, clat, clng, earliest, emergentRadiusKm, n).Scan(&newID); err != nil {
+			title, area, nat, clat, clng, earliest, cfg.RadiusKm, nTotal, adminPcode, cfg.WindowHrs, cfg.MinReports).Scan(&newID); err != nil {
 			return err
 		}
+		updWhere := "WHERE crisis_id IS NULL AND captured_at >= $2 AND ST_DWithin(geom::geography, " + ppt + ", $5*1000.0)"
+		updArgs := []any{newID, cutoff, lat, lng, cfg.RadiusKm}
+		if scope.active() {
+			updWhere += fmt.Sprintf(" AND adm%d_pcode = $6", scope.Level)
+			updArgs = append(updArgs, scope.Pcode)
+		}
 		if _, err := tx.Exec(ctx,
-			"UPDATE reports SET crisis_id = $1, updated_at = now()\n"+
-				"WHERE crisis_id IS NULL AND captured_at >= $2 AND ST_DWithin(geom::geography, "+cpt+", $5*1000.0)",
-			newID, cutoff, clat, clng, emergentRadiusKm); err != nil {
+			"UPDATE reports SET crisis_id = $1, updated_at = now()\n"+updWhere, updArgs...); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx,
@@ -193,20 +245,6 @@ func (s *Crises) DetectEmergentCrisis(ctx context.Context, lat, lng float64, at 
 		return "", txErr
 	}
 	return newID, nil
-}
-
-// ActivateIfProposed flips a 'proposed' crisis to 'active' — the ground-truth
-// activation step: community-EMERGENT crises are born 'proposed' and become
-// 'active' only when a community report is assigned to them (or an analyst
-// activates them via SetCrisisStatus). Reports true when the promotion
-// happened, false when the crisis was already active/closed.
-func (s *Crises) ActivateIfProposed(ctx context.Context, id string) (bool, error) {
-	tag, err := s.pool.Exec(ctx,
-		"UPDATE crises SET status = 'active' WHERE id = $1 AND status = 'proposed'", id)
-	if err != nil {
-		return false, err
-	}
-	return tag.RowsAffected() > 0, nil
 }
 
 // SetCrisisStatus transitions a crisis (analyst confirm/dismiss of an emergent

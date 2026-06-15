@@ -58,6 +58,10 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, h *handler.Handlers, logge
 		// auth
 		r.Post("/auth/login", h.Login)
 		r.With(requireAnalyst).Get("/auth/me", h.Me)
+		// MFA (TOTP) self-service for the authenticated analyst.
+		r.With(requireAnalyst).Post("/auth/mfa/enroll", h.EnrollMFA)
+		r.With(requireAnalyst).Post("/auth/mfa/verify", h.VerifyMFA)
+		r.With(requireAnalyst).Post("/auth/mfa/disable", h.DisableMFA)
 
 		// reports
 		r.Route("/reports", func(r chi.Router) {

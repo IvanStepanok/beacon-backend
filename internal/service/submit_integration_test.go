@@ -55,7 +55,7 @@ func testDB(t *testing.T) *pgxpool.Pool {
 func testService(pool *pgxpool.Pool) (*ReportService, *store.Reports, *store.Crises) {
 	reports := store.NewReports(pool)
 	crises := store.NewCrises(pool)
-	svc := NewReportService(pool, reports, store.NewAdmin(pool), crises, translate.New("", "en"), nil)
+	svc := NewReportService(pool, reports, store.NewAdmin(pool), crises, translate.New("", "en"), nil, store.DefaultEmergentConfig())
 	return svc, reports, crises
 }
 

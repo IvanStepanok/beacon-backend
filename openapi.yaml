@@ -5,7 +5,7 @@ info:
   description: |-
     Beacon is a crisis-damage crowdsourcing backend: anonymous mobile reporters
     submit building-damage reports (identified only by an `X-Device-Id` header),
-    and authenticated analysts (JWT bearer) verify, dispatch and export them.
+    and authenticated analysts (JWT bearer) verify and export them.
 
     ## Visibility tiers
     - **Anonymous / public** callers (no JWT) and the authenticated read-only
@@ -13,7 +13,7 @@ info:
       *public projection*: coordinates coarsened to 3 decimal places (~110 m),
       and `submitterId`, `what3words`, `plusCode`, `landmark`, `buildingId`,
       `buildingSource`, `infraName`, `gpsAccuracyMeters`, `description`,
-      tasking/operational fields, `modular` and `anonymization` are stripped.
+      `modular` and `anonymization` are stripped.
       Unverified reports return 404 so their existence and position are never
       leaked. Public aggregates (`/reports/area-groups`) count verified
       reports only for this tier, coherent with the verified-only public map.
@@ -26,25 +26,27 @@ info:
     the **newest active crisis** (the same crisis `GET /v1/crises/active`
     returns), falling back to a seeded default only when no crisis is active.
 
-    ## Admin codes are NOT P-codes
+    ## Admin code provenance
     The `adm1Pcode` / `adm2Pcode` / `adm3Pcode` JSON fields (and the
-    `admin1_shapeid` / `admin2_shapeid` / `admin3_shapeid` export columns)
-    carry **geoBoundaries shapeIDs** (prefixed `GB:` + shapeID) or illustrative
-    seed codes — they are **NOT official OCHA COD P-codes**. They are a valid
-    join key against the server's own `admin_areas` table, but must not be
-    presented as P-code provenance. An OCHA COD-AB boundary layer is on the
-    roadmap.
+    `admin1_pcode` / `admin2_pcode` / `admin3_pcode` export columns, HXL `+code`)
+    carry **official OCHA COD-AB P-codes where that country's COD has been
+    ingested** (`source='cod'`, fetched lazily from HDX, ranked above
+    geoBoundaries). Where no COD is published the value is a **`GB:`-prefixed
+    geoBoundaries shapeID** (or an illustrative seed code in demo data) — a valid
+    join key against the server's own `admin_areas` table, disclosed per row so it
+    is never mistaken for an official P-code.
 
     All error responses use a small JSON envelope: `{"error": "<code>",
     "message": "<human text>"}` (the 409 duplicate adds `existingId`).
 
     ## Scope
     This spec documents the **core reporting surface** (submit, list, detail,
-    photos, verification, tasking, exports, stats, crises, building timeline,
+    photos, verification, exports, stats, crises, building timeline,
     auth). Supporting routes — `/map/features`, `/tiles/reports/{z}/{x}/{y}`,
-    `/reports/area-groups`, `/reports/latest-per-building`, `/config`,
-    `/crises/{id}/status`, `/profile` — exist in `internal/api/router.go` but are
-    not yet documented here. `POST /v1/profile/points` is intentionally undocumented as an API:
+    `/reports/area-groups`, `/reports/latest-per-building`,
+    `/reports/{id}/withdraw`, `/crises/{id}/status`, `/profile` — exist in
+    `internal/api/router.go` but are not yet documented here.
+    `POST /v1/profile/points` is intentionally undocumented as an API:
     it is the RETIRED self-award endpoint and always answers **410 Gone**
     (points/badges are server-derived from verified reports, anti-gaming).
 servers:
@@ -59,7 +61,7 @@ tags:
   - name: photos
     description: Report photo upload and retrieval.
   - name: exports
-    description: Bulk interoperable exports (GeoJSON / HXL CSV / GeoPackage / KML / PDNA pivot).
+    description: Bulk interoperable exports (GeoJSON / HXL CSV / GeoPackage / KML / Shapefile).
   - name: stats
     description: Aggregated crisis statistics.
   - name: crises
@@ -240,7 +242,7 @@ paths:
         - name: damage
           in: query
           schema: { type: string }
-          description: "Comma-separated or repeated damage grades (either vocabulary): none,slight,moderate,severe,destroyed,minimal,partial,complete."
+          description: "Comma-separated or repeated damage grades (3-tier): minimal,partial,complete."
         - name: verification
           in: query
           schema: { type: string }
@@ -268,25 +270,6 @@ paths:
           in: query
           schema: { type: string }
           description: Admin-3 code (same provenance caveat).
-        - name: taskStatus
-          in: query
-          schema: { type: string }
-          description: "Comma-separated or repeated: new,triaged,assigned,in_progress,resolved,closed."
-        - name: severity
-          in: query
-          schema: { type: string }
-          description: "Comma-separated or repeated: routine,elevated,life_safety."
-        - name: lifeSafety
-          in: query
-          schema: { type: boolean }
-          description: Only life-safety reports.
-        - name: assignee
-          in: query
-          schema: { type: string }
-        - name: cluster
-          in: query
-          schema: { type: string }
-          description: "One humanitarian cluster: slsc,health,wash,education,food_security,protection,logistics,nutrition,etc,cccm,early_recovery."
         - $ref: '#/components/parameters/BBox'
         - name: page
           in: query
@@ -326,7 +309,7 @@ paths:
     get:
       tags: [exports]
       operationId: exportReports
-      summary: Bulk export (GeoJSON / HXL CSV / GeoPackage / KML / PDNA pivot)
+      summary: Bulk export (GeoJSON / HXL CSV / GeoPackage / KML / Shapefile)
       description: |-
         Analyst-only bulk export with exact coordinates and the full
         per-report row. The read-only `external_viewer` role is **denied
@@ -345,9 +328,11 @@ paths:
         appended after the fixed CSV columns) — plus `possiblyDamaged`,
         `debris`, `buildingId`, `verification`, `place`, `description`
         (free-text note, analyst language), `plus_code`, `accuracy_m`, and
-        the `admin1_shapeid` / `admin2_shapeid` / `admin3_shapeid` columns
-        (geoBoundaries shapeIDs / seed codes — NOT OCHA P-codes; their HXL
-        tags use `+id`, never `+code`).
+        the `admin1_pcode` / `admin2_pcode` / `admin3_pcode` columns
+        (official OCHA COD-AB P-codes where the country's COD has been ingested —
+        `source='cod'`, ranked above geoBoundaries; their HXL tags use `+code`. A
+        `GB:`-prefixed value is a geoBoundaries shapeID fallback for a country with
+        no published COD — disclosed as such, not an official P-code).
 
         - `geojson` — FeatureCollection; geometry is a Point `[lng, lat]` in
           decimal degrees, or `null` for a location-unresolved report (never
@@ -357,11 +342,9 @@ paths:
         - `gpkg` — OGC GeoPackage (single SQLite file), NULL geometry for
           unresolved reports.
         - `kml` — one Placemark per *resolved* report (unresolved skipped).
-        - `pdna` — a different shape: a PDNA-ready **damage-count** pivot
-          (sector × admin-2) of report counts per grade, HXL-tagged CSV. The
-          3-tier rollup (minimal/partial/complete) sums to `total`; the
-          5-level EMS-98 columns are detail only. It is NOT a loss/cost
-          estimation (no monetary figures).
+        - `shapefile` — a zipped ESRI Shapefile set (`.shp`/`.shx`/`.dbf`/`.prj`),
+          one record per resolved report; the legacy GIS interchange format
+          explicitly named in the challenge.
       security:
         - bearerAuth: []
       parameters:
@@ -369,7 +352,7 @@ paths:
           in: query
           schema:
             type: string
-            enum: [geojson, csv, gpkg, kml, pdna]
+            enum: [geojson, csv, gpkg, kml, shapefile]
             default: geojson
         - name: crisisId
           in: query
@@ -404,7 +387,7 @@ paths:
             text/csv:
               schema:
                 type: string
-                description: HXL-tagged CSV (format=csv) or PDNA damage-count pivot (format=pdna).
+                description: HXL-tagged CSV (format=csv).
             application/geopackage+sqlite3:
               schema:
                 type: string
@@ -414,6 +397,11 @@ paths:
               schema:
                 type: string
                 description: KML document (format=kml).
+            application/zip:
+              schema:
+                type: string
+                format: binary
+                description: Zipped ESRI Shapefile set (format=shapefile).
         "400":
           description: Unknown format (`bad_format`) or bad bbox (`bad_bbox`).
           content:
@@ -594,41 +582,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-
-  /v1/reports/{id}/task:
-    patch:
-      tags: [reports]
-      operationId: patchTask
-      summary: Advance a report's dispatch task (analyst)
-      description: |-
-        Mutator endpoint (same auth/scope rules as the verification PATCH).
-        Any subset of the body advances the task: status, assignee, severity,
-        cluster routing, disposition, or an audit note.
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/ReportId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TaskRequest'
-      responses:
-        "200":
-          description: The updated report.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Report'
-        "400":
-          $ref: '#/components/responses/BadRequest'
-        "401":
-          $ref: '#/components/responses/Unauthorized'
-        "403":
-          $ref: '#/components/responses/OutOfScope'
-        "404":
-          $ref: '#/components/responses/NotFound'
 
   /v1/buildings/{buildingId}/timeline:
     get:
@@ -1112,8 +1065,8 @@ components:
           description: Explicit crisis pin; empty or `"auto"` = server assigns by space+time (no match = pending).
         damage:
           type: string
-          enum: [none, slight, moderate, severe, destroyed, minimal, partial, complete]
-          description: Either vocabulary — 5-level EMS-98 (none…destroyed) or the 3-tier scale (minimal/partial/complete).
+          enum: [minimal, partial, complete]
+          description: The required 3-level damage scale — minimal / partial / complete.
         possiblyDamaged:
           type: boolean
           description: Reporter unsure / resolves the satellite "possibly damaged" class.
@@ -1233,16 +1186,6 @@ components:
           format: date-time
           nullable: true
           description: Defaults to the server time when omitted.
-        lifeSafety:
-          type: boolean
-          description: Intake life-safety question — true puts the report on the dispatch fast lane (severity=life_safety).
-        clusters:
-          type: array
-          items:
-            type: string
-            enum: [slsc, health, wash, education, food_security, protection, logistics, nutrition, etc, cccm, early_recovery]
-          description: Reporter-suggested humanitarian sector(s).
-
     Report:
       type: object
       description: |-
@@ -1261,8 +1204,8 @@ components:
           description: Anonymous submitter uuid; omitted in the public projection.
         damage:
           type: string
-          enum: [none, slight, moderate, severe, destroyed, minimal, partial, complete]
-          description: Raw grade (3-tier OR 5-level EMS-98, depending on capture scale).
+          enum: [minimal, partial, complete]
+          description: Damage grade — minimal / partial / complete (equals `damageTier`).
         damageTier:
           type: string
           enum: [minimal, partial, complete]
@@ -1377,26 +1320,6 @@ components:
           nullable: true
         anonymization:
           $ref: '#/components/schemas/Anonymization'
-        taskStatus:
-          type: string
-          description: "Dispatch stage: new, triaged, assigned, in_progress, resolved, closed (empty in the public projection)."
-        disposition:
-          type: string
-          nullable: true
-          enum: [resolved, cleared_nothing_found, no_action_needed, gone_on_arrival, unfounded, duplicate, referred]
-        assignee:
-          type: string
-          nullable: true
-        taskRef:
-          type: string
-          nullable: true
-        severity:
-          type: string
-          description: "routine, elevated or life_safety (empty in the public projection)."
-        lifeSafety: { type: boolean }
-        clusters:
-          type: array
-          items: { type: string }
         isMine: { type: boolean }
         synced: { type: boolean }
         sync:
@@ -1455,35 +1378,6 @@ components:
         force:
           type: boolean
           description: Overrides the photo gate — allows status=verified on a report with no photo. Recorded in the audit trail as forced.
-
-    TaskRequest:
-      type: object
-      description: Any subset advances the task; all fields optional.
-      properties:
-        taskStatus:
-          type: string
-          nullable: true
-          enum: [new, triaged, assigned, in_progress, resolved, closed]
-        assignee:
-          type: string
-          nullable: true
-        severity:
-          type: string
-          nullable: true
-          enum: [routine, elevated, life_safety]
-        disposition:
-          type: string
-          nullable: true
-          enum: [resolved, cleared_nothing_found, no_action_needed, gone_on_arrival, unfounded, duplicate, referred]
-        clusters:
-          type: array
-          nullable: true
-          items:
-            type: string
-            enum: [slsc, health, wash, education, food_security, protection, logistics, nutrition, etc, cccm, early_recovery]
-        note:
-          type: string
-          nullable: true
 
     Crisis:
       type: object
@@ -1636,32 +1530,12 @@ components:
         partial: { type: integer }
         complete: { type: integer }
 
-    DamageCounts:
-      type: object
-      description: 5-level EMS-98 detail; only covers ems98-scale reports and does NOT sum to totalReports.
-      properties:
-        none: { type: integer }
-        slight: { type: integer }
-        moderate: { type: integer }
-        severe: { type: integer }
-        destroyed: { type: integer }
-
     VerificationCounts:
       type: object
       properties:
         verified: { type: integer }
         pending: { type: integer }
         flagged: { type: integer }
-
-    TaskCounts:
-      type: object
-      properties:
-        new: { type: integer }
-        triaged: { type: integer }
-        assigned: { type: integer }
-        in_progress: { type: integer }
-        resolved: { type: integer }
-        closed: { type: integer }
 
     TimeBucket:
       type: object
@@ -1691,26 +1565,19 @@ components:
         totalReports: { type: integer }
         damageTierCounts:
           $ref: '#/components/schemas/DamageTierCounts'
-        damageCounts:
-          $ref: '#/components/schemas/DamageCounts'
         verificationCounts:
           $ref: '#/components/schemas/VerificationCounts'
         syncedCount: { type: integer }
         syncedPct: { type: integer }
         completePct:
           type: integer
-          description: Percent in the complete tier (tier-3 complete / EMS-98 destroyed).
+          description: Percent in the complete (tier-3) damage tier.
         destroyedPct:
           type: integer
           description: Alias of completePct (kept for dashboard compatibility).
         severePlusPct:
           type: integer
           description: Percent in partial+complete tiers (the "heavy damage" headline).
-        taskCounts:
-          $ref: '#/components/schemas/TaskCounts'
-        lifeSafetyOpen:
-          type: integer
-          description: Open life-safety tasks (fast lane).
         areas:
           type: array
           items:

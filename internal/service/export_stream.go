@@ -16,7 +16,19 @@ import (
 	_ "modernc.org/sqlite" // pure-Go SQLite driver (no CGO) for GeoPackage export
 
 	"github.com/stepanok/beacon-server/internal/model"
+	"github.com/stepanok/beacon-server/internal/store"
 )
+
+// reportH3 is the resolution-8 H3 cell id for an export row — the native h3id
+// interoperability column (RAPIDA/GeoHub). Empty for a location-unresolved report
+// (no point), matching the blank lat/lng those rows already emit. Computed with the
+// SAME helper as the stored h3_r8 column, so export and aggregation always agree.
+func reportH3(r model.Report) string {
+	if !reportResolved(r) || r.Lat == nil || r.Lng == nil {
+		return ""
+	}
+	return store.H3CellR8(*r.Lat, *r.Lng)
+}
 
 // RowSource invokes yield once per report, in export order, returning the first
 // error from the underlying query or from yield. Backed by a DB cursor
@@ -120,6 +132,9 @@ func geoJSONFeature(r *model.Report) exportFeature {
 	if v := deref(r.Adm3Pcode); v != "" {
 		props["admin3_pcode"] = v
 	}
+	if v := reportH3(*r); v != "" {
+		props["h3id"] = v
+	}
 	return exportFeature{Type: "Feature", Geometry: geom, Properties: props}
 }
 
@@ -178,7 +193,7 @@ func csvRowCells(r *model.Report, extras []string) []string {
 		flat["electricity"], flat["health_services"], flat["pressing_needs"],
 		strconv.FormatBool(r.PossiblyDamaged), r.Debris, deref(r.BuildingID),
 		r.Verification, r.Place, exportDescription(*r), deref(r.PlusCode), numPtr(r.GPSAccuracyMeters),
-		deref(r.Adm1Pcode), deref(r.Adm2Pcode), deref(r.Adm3Pcode),
+		deref(r.Adm1Pcode), deref(r.Adm2Pcode), deref(r.Adm3Pcode), reportH3(*r),
 	}
 	for _, c := range extras {
 		row = append(row, flat[c])
@@ -263,7 +278,7 @@ func StreamKML(w io.Writer, src RowSource) error {
 
 // gpkgAttrCols is the fixed attribute column list (beyond geom) for the GPKG
 // reports table, shared so the DDL and the INSERT stay in lockstep.
-var gpkgAttrCols = []string{"id", "damage", "possibly_damaged", "verification", "infrastructure", "infrastructure_name", "infrastructure_other_detail", "crisis", "debris", "building_id", "place", "description", "plus_code", "admin2_pcode", "admin3_pcode", "captured_at"}
+var gpkgAttrCols = []string{"id", "damage", "possibly_damaged", "verification", "infrastructure", "infrastructure_name", "infrastructure_other_detail", "crisis", "debris", "building_id", "place", "description", "plus_code", "admin2_pcode", "admin3_pcode", "captured_at", "h3id"}
 
 // gpkgRowArgs builds the INSERT bind values for one report (geom first, then the
 // fixed columns, then stable + dynamic modular extras), matching gpkgAttrCols.
@@ -282,7 +297,7 @@ func gpkgRowArgs(r *model.Report, extras []string) []any {
 		strings.Join(r.CrisisNature, ";"), r.Debris,
 		deref(r.BuildingID), r.Place, exportDescription(*r), deref(r.PlusCode),
 		deref(r.Adm2Pcode), deref(r.Adm3Pcode),
-		r.CapturedAt.UTC().Format(time.RFC3339)}
+		r.CapturedAt.UTC().Format(time.RFC3339), reportH3(*r)}
 	for _, c := range stableModularColumns {
 		args = append(args, flat[c])
 	}

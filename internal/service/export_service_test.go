@@ -140,8 +140,9 @@ func TestToCSV_C2HeadersAndUnresolved(t *testing.T) {
 		}
 	}
 	// Dynamic modular columns are APPENDED after the fixed schema (sorted), so the
-	// stable column positions never shift under existing consumers.
-	if !strings.HasSuffix(header, "admin3_pcode,pressing_needs_other,shelter_condition") {
+	// stable column positions never shift under existing consumers. h3id is the LAST
+	// fixed column (added after admin3_pcode), so modular columns follow it.
+	if !strings.HasSuffix(header, "admin3_pcode,h3id,pressing_needs_other,shelter_condition") {
 		t.Errorf("dynamic modular columns must be appended after the fixed schema: %s", header)
 	}
 	// HXL row tags the admin columns as official P-codes (B5) + tags the dynamic columns.
@@ -294,7 +295,7 @@ func TestExport_ReservedModularKeys(t *testing.T) {
 
 	// CSV: same renamed columns, appended after the fixed schema.
 	lines := strings.Split(string(ToCSV([]model.Report{r})), "\n")
-	if !strings.HasSuffix(lines[0], "admin3_pcode,x_fid,x_geom") {
+	if !strings.HasSuffix(lines[0], "admin3_pcode,h3id,x_fid,x_geom") {
 		t.Errorf("CSV header must append the renamed x_ columns: %s", lines[0])
 	}
 }

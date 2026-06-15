@@ -69,7 +69,11 @@ func run() error {
 	if cfg.BoundariesEnabled {
 		boundaries = boundary.New(pool, admin, logger)
 	}
-	reportSvc := service.NewReportService(pool, reports, admin, crises, translator, boundaries)
+	reportSvc := service.NewReportService(pool, reports, admin, crises, translator, boundaries, store.EmergentConfig{
+		RadiusKm:   cfg.EmergentRadiusKm,
+		WindowHrs:  cfg.EmergentWindowHrs,
+		MinReports: cfg.EmergentMinReports,
+	})
 	statsSvc := service.NewStatsService(reports)
 
 	// 4. seed (idempotent — reports gated by empty table, users by empty table;
@@ -79,6 +83,21 @@ func run() error {
 			return err
 		}
 	}
+
+	// Backfill the H3 cell on any resolved report that predates the h3_r8 column
+	// (00022) — in the BACKGROUND so it never blocks readiness. Idempotent + a no-op
+	// once filled (seeded/new rows already get h3 via UpsertReport, so this only
+	// touches non-reseeded legacy rows); chunked + resumable, so a transient failure
+	// just retries on the next boot.
+	go func() {
+		bg, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		if n, err := reports.BackfillH3R8(bg); err != nil {
+			logger.Warn("h3 backfill failed (will retry next boot)", "err", err)
+		} else if n > 0 {
+			logger.Info("h3 backfill complete", "rows", n)
+		}
+	}()
 
 	// Global ADM0 country baseline (idempotent, fast) — gives every point a country
 	// immediately and resolves point→ISO3 for the lazy ADM1 loader.
@@ -96,8 +115,9 @@ func run() error {
 		ReportSvc: reportSvc,
 		StatsSvc:  statsSvc,
 		Settings:  settings,
-		JWTSecret: cfg.JWTSecret,
-		PhotoDir:  cfg.PhotoDir,
+		JWTSecret:         cfg.JWTSecret,
+		PhotoDir:          cfg.PhotoDir,
+		DataEncryptionKey: cfg.DataEncryptionKey,
 	})
 	router := api.NewRouter(cfg, pool, h, logger)
 

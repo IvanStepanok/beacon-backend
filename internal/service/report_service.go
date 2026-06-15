@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"strings"
 	"time"
@@ -68,11 +69,15 @@ type ReportService struct {
 	admin      *store.Admin
 	crises     *store.Crises
 	translator *translate.Client
-	boundaries *boundary.Loader // nil when boundary loading is disabled
+	boundaries *boundary.Loader     // nil when boundary loading is disabled
+	emergent   store.EmergentConfig // deployment-tunable emergent-cluster thresholds
 }
 
-func NewReportService(pool *pgxpool.Pool, reports *store.Reports, admin *store.Admin, crises *store.Crises, translator *translate.Client, boundaries *boundary.Loader) *ReportService {
-	return &ReportService{pool: pool, reports: reports, admin: admin, crises: crises, translator: translator, boundaries: boundaries}
+func NewReportService(pool *pgxpool.Pool, reports *store.Reports, admin *store.Admin, crises *store.Crises, translator *translate.Client, boundaries *boundary.Loader, emergent store.EmergentConfig) *ReportService {
+	if emergent.MinReports < 2 {
+		emergent = store.DefaultEmergentConfig() // never let a misconfig make one report a crisis
+	}
+	return &ReportService{pool: pool, reports: reports, admin: admin, crises: crises, translator: translator, boundaries: boundaries, emergent: emergent}
 }
 
 func contains(set []string, v string) bool {
@@ -448,15 +453,14 @@ func (s *ReportService) Submit(ctx context.Context, req model.SubmitReportReques
 
 		// Server-side crisis assignment by space+time (unless the client pinned one).
 		// No match => crisis_id stays empty (pending); an emergent crisis may form below.
+		// A report may attach to a 'proposed' (unconfirmed emergent) crisis so the
+		// cluster keeps growing for the analyst — but this NEVER flips it to 'active'.
+		// Promotion proposed→active is an analyst-only decision (SetCrisisStatus); an
+		// unconfirmed cluster stays out of the public/default scope until a human
+		// confirms it. This is the fix for "one pin instantly shows an active crisis".
 		if r.CrisisID == "" && s.crises != nil {
 			if cid, err := s.crises.AssignCrisis(ctx, lat, lng, r.CapturedAt); err == nil {
 				r.CrisisID = cid
-				// Ground-truth activation: community-EMERGENT crises are born
-				// 'proposed' — the first community report assigned to one is the
-				// on-the-ground confirmation that promotes it to 'active'.
-				if cid != "" {
-					_, _ = s.crises.ActivateIfProposed(ctx, cid)
-				}
 			}
 		}
 	}
@@ -529,7 +533,12 @@ func (s *ReportService) Submit(ctx context.Context, req model.SubmitReportReques
 	// The crisis title/area come from the admin-boundary resolve at the centroid —
 	// never from a report's free-text place.
 	if inserted && r.CrisisID == "" && s.crises != nil && r.Lat != nil && r.Lng != nil {
-		_, _ = s.crises.DetectEmergentCrisis(ctx, *r.Lat, *r.Lng, r.CapturedAt, s.emergentAreaName)
+		// Best-effort: never fails the submit. But LOG the error rather than swallowing
+		// it — otherwise a future regression (bad SQL, an admin_areas FK violation) would
+		// manifest only as "emergent crises silently never form", impossible to diagnose.
+		if _, err := s.crises.DetectEmergentCrisis(ctx, *r.Lat, *r.Lng, r.CapturedAt, s.emergent, adminScopeFromChain(r.Admin), s.emergentAreaName); err != nil {
+			slog.WarnContext(ctx, "emergent crisis detection failed", "err", err, "reportID", r.ID)
+		}
 	}
 
 	// Lazily ensure this point's country has admin boundaries loaded, so this report
@@ -550,6 +559,26 @@ func (s *ReportService) Submit(ctx context.Context, req model.SubmitReportReques
 		return nil, false, err
 	}
 	return stored, inserted, nil
+}
+
+// adminScopeFromChain turns a report's resolved admin chain into the scope an
+// emergent cluster is bounded to: the DEEPEST available area with a P-code
+// (ADM2 preferred, else ADM1). A nil chain or a point outside all boundaries
+// yields a zero AdminScope → DetectEmergentCrisis falls back to a pure 2 km
+// radius (legacy behaviour). ADM3 is intentionally NOT used as the scope key:
+// it is too fine to host a meaningful multi-reporter cluster and is sparsely
+// populated, so we cap the clustering granularity at ADM2.
+func adminScopeFromChain(chain *model.AdminChain) store.AdminScope {
+	if chain == nil {
+		return store.AdminScope{}
+	}
+	if chain.Adm2 != nil && chain.Adm2.Pcode != "" {
+		return store.AdminScope{Level: 2, Pcode: chain.Adm2.Pcode}
+	}
+	if chain.Adm1 != nil && chain.Adm1.Pcode != "" {
+		return store.AdminScope{Level: 1, Pcode: chain.Adm1.Pcode}
+	}
+	return store.AdminScope{}
 }
 
 // emergentAreaName resolves the DEEPEST available admin-area name (ADM2 > ADM1 >

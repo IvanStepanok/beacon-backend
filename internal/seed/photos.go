@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/stepanok/beacon-server/internal/crypto"
 	"github.com/stepanok/beacon-server/internal/model"
 )
 
@@ -94,7 +95,17 @@ func installSeedPhoto(photoDir string, r model.Report, photos []seedPhoto) error
 		if err := os.MkdirAll(photoDir, 0o755); err != nil {
 			return err
 		}
-		return os.WriteFile(filepath.Join(photoDir, r.ID+".jpg"), p.data, 0o644)
+		data := p.data
+		// Encrypt seed photos at rest too when a key is configured, so the demo store
+		// matches the live upload path (the photo handler decrypts transparently on read).
+		if key, kerr := crypto.ParseKey(os.Getenv("DATA_ENCRYPTION_KEY")); kerr == nil && len(key) == crypto.KeyLen {
+			enc, eerr := crypto.Seal(key, data)
+			if eerr != nil {
+				return eerr
+			}
+			data = enc
+		}
+		return os.WriteFile(filepath.Join(photoDir, r.ID+".jpg"), data, 0o600)
 	}
 	return fmt.Errorf("report %s references unknown seed photo %q", r.ID, r.Photos[0].LocalPath)
 }

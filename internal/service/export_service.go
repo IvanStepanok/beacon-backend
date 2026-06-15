@@ -258,8 +258,8 @@ func csvCell(s string) string {
 // Any DYNAMIC modular sections beyond the three stable ones are appended after these fixed
 // columns (#indicator+<name>).
 var (
-	csvColumns = []string{"id", "latitude", "longitude", "timestamp", "damage_classification", "damage", "infrastructure_type", "infrastructure_name", "infrastructure_other_detail", "hazard_type", "electricity", "health_services", "pressing_needs", "possiblyDamaged", "debris", "buildingId", "verification", "place", "description", "plus_code", "accuracy_m", "admin1_pcode", "admin2_pcode", "admin3_pcode"}
-	hxlRow     = []string{"#meta+id", "#geo+lat", "#geo+lon", "#date", "#severity+grade", "#severity+raw", "#sector", "#loc+name+infrastructure", "#loc+name+infrastructure+detail", "#cause", "#indicator+electricity", "#indicator+health", "#indicator+needs", "#indicator+possibly", "#indicator+debris", "#loc+building+id", "#status+verification", "#loc+name", "#description", "#geo+code+plus", "#indicator+accuracy", "#loc+adm1+code", "#loc+adm2+code", "#loc+adm3+code"}
+	csvColumns = []string{"id", "latitude", "longitude", "timestamp", "damage_classification", "damage", "infrastructure_type", "infrastructure_name", "infrastructure_other_detail", "hazard_type", "electricity", "health_services", "pressing_needs", "possiblyDamaged", "debris", "buildingId", "verification", "place", "description", "plus_code", "accuracy_m", "admin1_pcode", "admin2_pcode", "admin3_pcode", "h3id"}
+	hxlRow     = []string{"#meta+id", "#geo+lat", "#geo+lon", "#date", "#severity+grade", "#severity+raw", "#sector", "#loc+name+infrastructure", "#loc+name+infrastructure+detail", "#cause", "#indicator+electricity", "#indicator+health", "#indicator+needs", "#indicator+possibly", "#indicator+debris", "#loc+building+id", "#status+verification", "#loc+name", "#description", "#geo+code+plus", "#indicator+accuracy", "#loc+adm1+code", "#loc+adm2+code", "#loc+adm3+code", "#geo+h3"}
 )
 
 // ToCSV is the in-memory wrapper over StreamCSV (tests + small callers); the

@@ -24,6 +24,9 @@ type Deps struct {
 	StatsSvc  *service.StatsService
 	JWTSecret string
 	PhotoDir  string
+	// DataEncryptionKey (AES-256, 32 bytes) encrypts photos + MFA secrets at rest.
+	// nil in dev = at-rest encryption disabled; required in prod (config fail-closed).
+	DataEncryptionKey []byte
 }
 
 type Handlers struct {

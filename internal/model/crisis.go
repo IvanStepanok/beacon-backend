@@ -29,6 +29,13 @@ type Crisis struct {
 	ResponseID  *string    `json:"responseId,omitempty"` // optional umbrella response
 	ReportCount int        `json:"reportCount"`          // denormalized cluster size
 
+	// DistinctSubmitters is the count of distinct devices/submitters behind this
+	// crisis's reports — the corroboration signal the review queue ranks on (an
+	// emergent cluster from many independent reporters is far stronger than one
+	// device posting repeatedly). It is also the quantity the emergent threshold
+	// (BEACON_EMERGENT_MIN_REPORTS) is measured against at formation time.
+	DistinctSubmitters int `json:"distinctSubmitters"`
+
 	// Set only on /crises/near responses (relative to the queried point).
 	DistanceKm *float64 `json:"distanceKm,omitempty"`
 	Covers     *bool    `json:"covers,omitempty"` // true if the queried point is within radiusKm
@@ -69,6 +76,15 @@ type AreaGroup struct {
 	Count     int    `json:"count"`
 	Worst     string `json:"worst"`
 	WorstTier string `json:"worstTier"`
+
+	// H3 hotspot geometry — populated only by the H3 aggregation (AreaGroupsH3); the
+	// place-based grouping leaves these nil (so the response stays identical). H3 is the
+	// resolution-8 cell id; Lat/Lng its report centroid for client rendering. POINTERS,
+	// not float64+omitempty, so a legitimate 0.0 centroid (equator / prime meridian) is
+	// emitted rather than silently dropped.
+	H3  string   `json:"h3,omitempty"`
+	Lat *float64 `json:"lat,omitempty"`
+	Lng *float64 `json:"lng,omitempty"`
 }
 
 type Profile struct {

@@ -103,6 +103,8 @@ func (u User) ScopeAllows(crisisID string) bool {
 type LoginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+	// MfaCode is the 6-digit TOTP code, required only when the account has MFA enabled.
+	MfaCode string `json:"mfaCode,omitempty"`
 }
 
 type LoginResponse struct {

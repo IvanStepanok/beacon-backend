@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+
+	"github.com/stepanok/beacon-server/internal/crypto"
 )
 
 const maxPhotoBytes = 12 << 20 // 12 MB
@@ -115,12 +117,24 @@ func (h *Handlers) UploadPhoto(w http.ResponseWriter, r *http.Request) {
 	// (the API is anonymous) could upload a GPS-tagged photo and lie about it.
 	data = stripJPEGMetadata(data)
 
+	// Encrypt the photo AT REST (AES-256-GCM) when a key is configured. The stored bytes
+	// carry a magic header so reads transparently handle both encrypted and legacy
+	// plaintext files. Photos are the highest-sensitivity payload (faces, locations).
+	if len(h.d.DataEncryptionKey) == crypto.KeyLen {
+		enc, encErr := crypto.Seal(h.d.DataEncryptionKey, data)
+		if encErr != nil {
+			writeErr(w, http.StatusInternalServerError, "store", "cannot secure photo")
+			return
+		}
+		data = enc
+	}
+
 	if err := os.MkdirAll(h.d.PhotoDir, 0o755); err != nil {
 		writeErr(w, http.StatusInternalServerError, "store", "cannot create photo directory")
 		return
 	}
 	path := filepath.Join(h.d.PhotoDir, photoFileName(id))
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		writeErr(w, http.StatusInternalServerError, "store", "cannot write photo")
 		return
 	}
@@ -192,17 +206,29 @@ func (h *Handlers) GetPhoto(w http.ResponseWriter, r *http.Request) {
 	}
 
 	path := filepath.Join(h.d.PhotoDir, photoFileName(id))
-	f, err := os.Open(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	defer f.Close()
+	// Decrypt at-rest photos transparently; serve any legacy plaintext (no magic) as-is.
+	if crypto.IsEncrypted(raw) {
+		if len(h.d.DataEncryptionKey) != crypto.KeyLen {
+			http.NotFound(w, r) // encrypted on disk but no key to read it → treat as absent
+			return
+		}
+		dec, derr := crypto.Open(h.d.DataEncryptionKey, raw)
+		if derr != nil {
+			http.NotFound(w, r) // tampered/garbled → never serve raw ciphertext
+			return
+		}
+		raw = dec
+	}
 	w.Header().Set("Content-Type", "image/jpeg")
 	// Per-report visibility depends on auth/verification → don't let shared caches
 	// serve it to the wrong tier.
 	w.Header().Set("Cache-Control", "private, max-age=86400")
-	_, _ = io.Copy(w, f)
+	_, _ = w.Write(raw)
 }
 
 // photoFileName maps a report id to a safe on-disk filename (ids are simple, but be defensive).

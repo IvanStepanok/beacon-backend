@@ -16,7 +16,7 @@ Multiplatform) and the **analyst dashboard** (Next.js).
   `version` and `supersedesReportId` inside a transaction (row-locked), so the
   damage history of a building is real, not fabricated.
 - **Open standards & interoperability.** PostGIS geometry; export to **GeoJSON,
-  HXL-tagged CSV, GeoPackage (pure-Go), KML and a PDNA Volume B pivot** — the
+  HXL-tagged CSV, GeoPackage (pure-Go), KML and Shapefile** — the
   in-app reporter export is a schema-aligned subset of the same GeoJSON/CSV
   vocabulary (same column names; the device file has no verification/admin
   columns and no HXL row).
@@ -78,13 +78,13 @@ internal/seed      deterministic Antakya seeder (parity with both clients) + emb
 | Format | Output |
 |---|---|
 | `geojson` | FeatureCollection; the in-app export emits a schema-aligned subset (same property names, minus the verification/admin columns) |
-| `csv` | HXL-tagged CSV (HDX-ready), includes `plus_code` + `admin*_shapeid` columns (geoBoundaries shape ids — not official OCHA P-codes; COD-AB P-code layer is roadmap) |
+| `csv` | HXL-tagged CSV (HDX-ready), includes `plus_code` + `admin*_pcode` columns (official OCHA COD-AB P-codes where a country's COD is ingested — `source='cod'`, ranked above geoBoundaries; a `GB:`-prefixed value is a geoBoundaries shapeID fallback for countries with no published COD) |
 | `gpkg` | OGC GeoPackage (single SQLite file, pure-Go writer, no CGO) |
 | `kml` | KML placemarks (gate fields + secondary impacts per placemark; opens in Google Earth) |
-| `pdna` | PDNA-ready damage-count pivot: ADM2 × sector rows, count columns minimal/partial/complete (+ EMS-98 detail) — damage counts, not a loss/cost estimate |
+| `shapefile` | Zipped ESRI Shapefile set (`.shp`/`.shx`/`.dbf`/`.prj`), one record per resolved report — the legacy GIS interchange format named in the challenge |
 
-Row formats carry both damage vocabularies: the raw grade and the required
-3-tier rollup (`damage_tier` ∈ {minimal, partial, complete}).
+Row formats carry the required 3-tier damage classification
+(`damage_tier` ∈ {minimal, partial, complete}).
 
 ## API (v1)
 
@@ -97,23 +97,15 @@ Row formats carry both damage vocabularies: the raw grade and the required
 | GET | `/api/v1/reports/{id}` | both (public sees verified-only, coarsened projection) |
 | POST | `/api/v1/reports/{id}/photo` | mobile (anonymous upload, sniffed + ownership-bound) |
 | GET | `/api/v1/reports/{id}/photo` | both (public: verified photos only) |
-| PATCH | `/api/v1/reports/{id}/verification` | analyst; body `{status, note?, force?}` — verifying a photo-less report is 409 `photo_required` unless `force: true`; note/force land in the audit trail |
-| PATCH | `/api/v1/reports/{id}/task` | analyst dispatch (status/assignee/severity/disposition/clusters, audited) |
-| GET | `/api/v1/reports/latest-per-building` | mobile (map pins; `crisisId` or `bbox`) |
-| GET | `/api/v1/reports/area-groups` | both |
-| GET | `/api/v1/reports/export?format=geojson\|csv\|gpkg\|kml\|pdna` | analyst (see Exports) |
+| PATCH | `/api/v1/reports/{id}/verification` | analyst; body `{status, note?, force?}` — verifying a photo-less report is 409 `photo_required` unless `force: true`; note/force land in the audit trail || GET | `/api/v1/reports/latest-per-building` | mobile (map pins; `crisisId` or `bbox`) |
+| GET | `/api/v1/reports/area-groups[?grid=h3]` | both (default: place groups; `grid=h3`: H3 hexagonal hotspot cells) |
+| GET | `/api/v1/reports/export?format=geojson\|csv\|gpkg\|kml\|shapefile` | analyst (see Exports) |
 | GET | `/api/v1/buildings/{id}/timeline` | both (public: verified entries, notes stripped) |
 | GET | `/api/v1/map/features?bbox=` | both |
-| GET | `/api/v1/tiles/reports/{z}/{x}/{y}` | both (MVT: clusters at low zoom, points at high zoom) |
-| GET | `/api/v1/config`, PATCH `/api/v1/config` | global capture-scale config (PATCH: analyst) |
-| GET | `/api/v1/form-schema?crisisId=` | mobile (modular capture-form sections, resolved with crisis overrides) |
+| GET | `/api/v1/tiles/reports/{z}/{x}/{y}` | both (MVT: clusters at low zoom, points at high zoom) || GET | `/api/v1/form-schema?crisisId=` | mobile (modular capture-form sections, resolved with crisis overrides) |
 | GET | `/api/v1/stats/overview` | dashboard (analyst, scoped) |
-| GET | `/api/v1/crises`, `/crises/{id}`, `/crises/active`, `/crises/near` | both |
-| GET | `/api/v1/crises/{id}/danger-zones` | both |
-| PATCH | `/api/v1/crises/{id}/status` | analyst (confirm/dismiss emergent crises) |
-| PATCH | `/api/v1/crises/{id}/form` | senior analyst (per-crisis form-schema overrides) |
-| POST | `/api/v1/feeds/refresh` | analyst (on-demand USGS/GDACS ingest) |
-| GET | `/api/v1/profile` | mobile (points/badges are **server-derived** from verified reports) |
+| GET | `/api/v1/crises`, `/crises/{id}`, `/crises/active`, `/crises/near` | both || PATCH | `/api/v1/crises/{id}/status` | analyst — the ONLY proposed→active path (confirm/dismiss emergent crises; see [docs/CRISIS-LIFECYCLE.md](docs/CRISIS-LIFECYCLE.md)) |
+| PATCH | `/api/v1/crises/{id}/form` | senior analyst (per-crisis form-schema overrides) || GET | `/api/v1/profile` | mobile (points/badges are **server-derived** from verified reports) |
 | POST | `/api/v1/profile/points` | **410 Gone** — retired self-award endpoint (anti-gaming) |
 
 Reports carry `plusCode` as the canonical short location code; the legacy
@@ -121,4 +113,26 @@ Reports carry `plusCode` as the canonical short location code; the legacy
 older clients. The authoritative surface is `internal/api/router.go`, documented
 in [`openapi.yaml`](./openapi.yaml).
 
-Config: see `.env.example`. In `ENV=prod` analyst mutations require a bearer token.
+Config: see `.env.example` (incl. the `BEACON_EMERGENT_*` clustering thresholds). In
+`ENV=prod` analyst mutations require a bearer token. The crisis lifecycle — how an
+event is declared vs. auto-detected, the proposed→active analyst gate, the
+distinct-submitter threshold, admin-area scope, and H3 hotspots — is documented in
+[docs/CRISIS-LIFECYCLE.md](docs/CRISIS-LIFECYCLE.md).
+
+## Data sources & attribution
+
+Beacon's own code and content are Apache-2.0 (see [`LICENSE`](./LICENSE)). The
+administrative-boundary data it uses is **not redistributed in this repository** beyond a
+single public-domain baseline — the higher-resolution layers are fetched at runtime by the
+deploying party from their upstreams:
+
+| Layer | Source | How obtained | Licence |
+|---|---|---|---|
+| ADM0 country baseline | **Natural Earth** (`ne_110m`, `internal/boundary/data/countries.geojson`) | bundled (embedded) | **Public domain** — no attribution required (courtesy credit given here) |
+| ADM1/ADM2 admin areas + shapeIDs | **geoBoundaries** (gbOpen) | fetched lazily per country at runtime from `geoboundaries.org` | **CC-BY 4.0** — attribute "geoBoundaries" |
+| Official P-codes (ranked authoritative) | **OCHA Common Operational Datasets — Administrative Boundaries (COD-AB)** via HDX | fetched lazily per country at runtime from `data.humdata.org` | **CC-BY-IGO 3.0** — attribute "OCHA / HDX" |
+| Seed demo photos | Free-licensed 2023 Hatay earthquake imagery | bundled | see [`internal/seed/photos/ATTRIBUTION.md`](internal/seed/photos/ATTRIBUTION.md) |
+
+Because the geoBoundaries and COD-AB layers are fetched at deploy/run time rather than
+shipped in this repo, publishing Beacon does **not** redistribute that data; deployments
+that surface boundary names/shapes should display the CC-BY / CC-BY-IGO attributions above.

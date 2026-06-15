@@ -716,6 +716,105 @@ func (s *Reports) AreaGroups(ctx context.Context, crisisID string, verifiedOnly 
 	return out, rows.Err()
 }
 
+// AreaGroupsH3 aggregates a crisis's reports into H3 resolution-8 hexagonal cells —
+// the geometry-based hotspot view (vs AreaGroups' free-text place grouping, which
+// stays available for the textual ranking). Each cell carries its report centroid
+// (for client rendering), a representative place label (the most-damaged non-empty
+// place in the cell), the count and the worst damage tier. verifiedOnly mirrors
+// AreaGroups exactly: the public/anonymous tier counts verified reports only, so the
+// hexagonal heatmap stays coherent with the verified-only public map. Reports with
+// no cell (location-unresolved) are excluded — they have no point to bin.
+func (s *Reports) AreaGroupsH3(ctx context.Context, crisisID string, verifiedOnly bool) ([]model.AreaGroup, error) {
+	cond := ""
+	if verifiedOnly {
+		cond = " AND verification = 'verified'"
+	}
+	sql := `
+		WITH ranked AS (
+		  SELECT h3_r8, lat, lng, place,
+		         damage, damage_tier,
+		         CASE damage_tier WHEN 'complete' THEN 2 WHEN 'partial' THEN 1 ELSE 0 END AS tier_rank
+		  FROM reports WHERE crisis_id = $1 AND h3_r8 IS NOT NULL` + cond + `
+		)
+		SELECT h3_r8 AS cell, count(*) AS cnt,
+		       COALESCE(avg(lat),0) AS clat, COALESCE(avg(lng),0) AS clng,
+		       (ARRAY_AGG(damage      ORDER BY tier_rank DESC, damage DESC))[1] AS worst,
+		       (ARRAY_AGG(damage_tier ORDER BY tier_rank DESC, damage DESC))[1] AS worst_tier,
+		       (ARRAY_AGG(place ORDER BY (place <> '') DESC, tier_rank DESC))[1] AS label
+		FROM ranked
+		GROUP BY h3_r8 ORDER BY cnt DESC, cell ASC`
+	rows, err := s.pool.Query(ctx, sql, crisisID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.AreaGroup{}
+	for rows.Next() {
+		var g model.AreaGroup
+		if err := rows.Scan(&g.H3, &g.Count, &g.Lat, &g.Lng, &g.Worst, &g.WorstTier, &g.Area); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// BackfillH3R8 stamps the h3_r8 cell on any resolved report still missing it — rows
+// that predate the H3 column (00022). Idempotent and a no-op once filled. Computed in
+// Go (the deployment Postgres is not assumed to have the h3 extension). It works in
+// bounded CHUNKS — a LIMITed SELECT then ONE set-based UPDATE per chunk via unnest —
+// so memory stays at one chunk and the table is updated in few round-trips even at
+// 500k scale. Intended to run in the background at startup (never blocks readiness).
+// Returns the number of rows backfilled. A chunk that yields zero computable cells
+// stops the loop (can't make progress) rather than spinning.
+func (s *Reports) BackfillH3R8(ctx context.Context) (int, error) {
+	const chunk = 2000
+	total := 0
+	for {
+		rows, err := s.pool.Query(ctx,
+			"SELECT id, lat, lng FROM reports WHERE h3_r8 IS NULL AND lat IS NOT NULL AND lng IS NOT NULL LIMIT $1", chunk)
+		if err != nil {
+			return total, err
+		}
+		var ids, cells []string
+		selected := 0
+		for rows.Next() {
+			var id string
+			var lat, lng float64
+			if err := rows.Scan(&id, &lat, &lng); err != nil {
+				rows.Close()
+				return total, err
+			}
+			selected++
+			if cell := H3CellR8(lat, lng); cell != "" {
+				ids = append(ids, id)
+				cells = append(cells, cell)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return total, err
+		}
+		if selected == 0 {
+			return total, nil // table drained
+		}
+		if len(ids) == 0 {
+			return total, nil // page had only un-cellable rows → no progress possible
+		}
+		tag, err := s.pool.Exec(ctx,
+			"UPDATE reports AS r SET h3_r8 = d.cell"+
+				" FROM (SELECT unnest($1::text[]) AS id, unnest($2::text[]) AS cell) d"+
+				" WHERE r.id = d.id AND r.h3_r8 IS NULL", ids, cells)
+		if err != nil {
+			return total, err
+		}
+		total += int(tag.RowsAffected())
+		if selected < chunk {
+			return total, nil // last (partial) page
+		}
+	}
+}
+
 // Reports is the reports SQL store.
 type Reports struct{ pool *pgxpool.Pool }
 

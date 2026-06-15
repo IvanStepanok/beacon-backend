@@ -14,6 +14,21 @@ services:
       POSTGRES_USER: beacon
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: beacon
+    # Enable TLS so the backend<->Postgres link is encrypted (the app uses sslmode=require).
+    # A self-signed server cert is minted on each boot — require mode encrypts without
+    # verifying identity, which is correct on the private 'internal' network the cert never
+    # leaves. openssl ships in the postgis image. We override the entrypoint to mint the
+    # cert, then hand off to the stock postgres entrypoint so initdb/startup are unchanged.
+    entrypoint: ["bash", "-lc"]
+    command:
+      - >
+        openssl req -new -x509 -days 3650 -nodes -subj '/CN=beacon-db'
+        -out /var/lib/postgresql/server.crt -keyout /var/lib/postgresql/server.key &&
+        chmod 600 /var/lib/postgresql/server.key &&
+        chown postgres:postgres /var/lib/postgresql/server.crt /var/lib/postgresql/server.key &&
+        exec docker-entrypoint.sh postgres -c ssl=on
+        -c ssl_cert_file=/var/lib/postgresql/server.crt
+        -c ssl_key_file=/var/lib/postgresql/server.key
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U beacon -d beacon"]
       interval: 5s
@@ -32,10 +47,10 @@ services:
       db:
         condition: service_healthy
     environment:
-      # DB is reachable only on the private 'internal' Docker network (never exposed
-      # to the host/web), so sslmode=prefer: use TLS if the server offers it, else
-      # plaintext over the private bridge — works with or without DB TLS configured.
-      DATABASE_URL: "postgres://beacon:${POSTGRES_PASSWORD}@db:5432/beacon?sslmode=prefer"
+      # DB transit is TLS-encrypted (the db service runs ssl=on). sslmode=require ENFORCES
+      # TLS — the backend refuses a silent plaintext fallback. ENV=prod additionally fails
+      # closed if this is ever weakened to disable/prefer (see internal/config.sslEnforced).
+      DATABASE_URL: "postgres://beacon:${POSTGRES_PASSWORD}@db:5432/beacon?sslmode=require"
       HTTP_ADDR: ":8080"
       ENV: prod
       RUN_SEED: "false"
@@ -45,8 +60,9 @@ services:
       LOG_LEVEL: info
       PGX_MAX_CONNS: "10"
       PHOTO_DIR: /data/photos
-      FEEDS_ENABLED: "true"
-      FEEDS_INTERVAL_MIN: "30"
+      # AES-256 key (base64/hex, 32 bytes) for at-rest encryption of photos + MFA secrets.
+      # Required in prod — the backend refuses to boot without it (config fail-closed).
+      DATA_ENCRYPTION_KEY: "${DATA_ENCRYPTION_KEY}"
       TRANSLATE_URL: "http://beacon-libretranslate:5000"
       TRANSLATE_TARGET: "en"
     volumes:

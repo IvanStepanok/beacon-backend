@@ -240,18 +240,30 @@ func (h *Handlers) ReportTile(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(mvt)
 }
 
-// GET /api/v1/reports/area-groups
+// GET /api/v1/reports/area-groups[?grid=h3]
 // Public aggregate. For the public tier (anonymous OR external_viewer) the counts
 // cover VERIFIED reports only — mirroring /map/features — so the public page never
 // shows area totals that disagree with (or leak beyond) the verified-only public
 // map. Real analyst roles keep the full all-statuses counts.
+//
+// ?grid=h3 returns the HEXAGONAL hotspot view: reports binned into H3 res-8 cells,
+// each with a centroid + representative place label (the spatial geometry the
+// community heatmap renders). The default (no grid param) keeps the legacy free-text
+// place grouping for the textual "most-affected areas" ranking — both stay available
+// so existing clients are unaffected.
 func (h *Handlers) AreaGroups(w http.ResponseWriter, r *http.Request) {
 	cid, err := h.crisisID(r)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "internal", "could not resolve crisis scope")
 		return
 	}
-	groups, err := h.d.Reports.AreaGroups(r.Context(), cid, isPublicTier(r))
+	pub := isPublicTier(r)
+	var groups []model.AreaGroup
+	if r.URL.Query().Get("grid") == "h3" {
+		groups, err = h.d.Reports.AreaGroupsH3(r.Context(), cid, pub)
+	} else {
+		groups, err = h.d.Reports.AreaGroups(r.Context(), cid, pub)
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "internal", "query failed")
 		return

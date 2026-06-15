@@ -8,9 +8,28 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	h3 "github.com/uber/h3-go/v4"
 
 	"github.com/stepanok/beacon-server/internal/model"
 )
+
+// h3Resolution is the H3 grid resolution used for hotspot aggregation and the
+// exported h3id. Res 8 ≈ 0.74 km² hexagons — a neighbourhood-scale grain that
+// reads as a damage hotspot without pinpointing a single building, and roughly
+// matches the public-tile coarsening intent. Kept as one constant so insert,
+// aggregation and export always agree; a per-crisis grain is a future knob.
+const h3Resolution = 8
+
+// H3CellR8 returns the resolution-8 H3 cell id (hex string) for a point — the
+// hexagonal aggregation/interoperability key. Returns "" if H3 rejects the point
+// (it never should for a valid lat/lng), so callers can treat "" as "no cell".
+func H3CellR8(lat, lng float64) string {
+	cell, err := h3.LatLngToCell(h3.LatLng{Lat: lat, Lng: lng}, h3Resolution)
+	if err != nil {
+		return ""
+	}
+	return cell.String()
+}
 
 // querier is satisfied by both *pgxpool.Pool and pgx.Tx.
 type querier interface {
@@ -29,7 +48,8 @@ INSERT INTO reports (
   ai_level, ai_confidence, photos, size_bytes, modular, anonymization,
   is_mine, synced, sync_state, captured_at, created_at, updated_at, admin,
   clusters,
-  location_resolved
+  location_resolved,
+  h3_r8
 ) VALUES (
   $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
   $12,
@@ -41,7 +61,8 @@ INSERT INTO reports (
   $27,$28,$29,$30,$31,$32,
   $33,$34,$35,$36,$37,$38,$39,
   $40,
-  $41
+  $41,
+  $42
 ) ON CONFLICT (id) DO NOTHING`
 
 // UpsertReport inserts a fully-formed report idempotently (ON CONFLICT (id) DO
@@ -93,6 +114,16 @@ func UpsertReport(ctx context.Context, q querier, r model.Report) (inserted bool
 		r.Clusters = []string{}
 	}
 
+	// H3 cell for hotspot aggregation + the h3id export column. NULL for a
+	// location-unresolved report (no point to index). Computed on EVERY insert path
+	// (submit, seed) so the h3_r8 column is always populated for resolved reports.
+	var h3cell any
+	if r.Lat != nil && r.Lng != nil {
+		if c := H3CellR8(*r.Lat, *r.Lng); c != "" {
+			h3cell = c
+		}
+	}
+
 	// r.Lng/r.Lat are *float64; pgx encodes nil → NULL, and the geom expression's
 	// CASE leaves geom NULL when either is NULL (a location-unresolved report).
 	tag, err := q.Exec(ctx, insertReportSQL,
@@ -105,6 +136,7 @@ func UpsertReport(ctx context.Context, q querier, r model.Report) (inserted bool
 		r.IsMine, r.Synced, sync, r.CapturedAt, r.CreatedAt, r.UpdatedAt, admin,
 		r.Clusters,
 		r.LocationResolved,
+		h3cell,
 	)
 	if err != nil {
 		return false, err
