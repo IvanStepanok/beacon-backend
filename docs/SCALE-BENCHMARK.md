@@ -9,11 +9,11 @@ bound** and the two scalability fixes it surfaced.
 
 ## Method
 
-- **Data:** 500,000 synthetic reports generated into the real schema for one
-  crisis (`crisis-antakya`), via `scripts/bench_seed.sql` — realistic admin
+- Data: 500,000 synthetic reports generated into the real schema for one
+  crisis (`crisis-antakya`), via `scripts/bench_seed.sql`. Admin
   cardinality (~20 ADM2 districts / ~200 ADM3 mahalle), points spread over a
   0.5°×0.5° box, balanced damage tiers / verification states, modular blobs.
-- **Stack:** Go backend (single instance) + PostgreSQL 16 + PostGIS, local
+- Stack: Go backend (single instance) + PostgreSQL 16 + PostGIS, local
   (Apple Silicon, Docker Postgres). End-to-end timings are over HTTP against the
   running server (query + serialization + transfer), best-of-5 warm.
 - Seed load time for 500k rows (all indexes + GiST live): **~31 s**.
@@ -27,9 +27,9 @@ bound** and the two scalability fixes it surfaced.
 | All indexes | 136 MB |
 | Largest indexes | GiST geom 27 MB · PK 26 MB · idempotency-key 26 MB · place trigram 16 MB |
 
-Photos are stored on a separate object volume, not in the row — so the relational
+Photos are stored on a separate object volume, not in the row, so the relational
 footprint of a 500k national crisis is ~0.5 GB. 100 crises/year ≈ 50 GB of
-relational data, trivially within a managed Postgres instance.
+relational data, well within a managed Postgres instance.
 
 ## Query latency @ 500k (analyst dashboard)
 
@@ -48,7 +48,7 @@ The list is keyset-paginated (`LIMIT n+1` on `idx_reports_crisis_captured`), so
 page latency is independent of table size. Submit cost is dominated by the
 per-insert spatial dedup lookup against the 500k GiST index; 198 req/s/instance
 is ample (the durable client-side outbox absorbs bursts, POST is idempotent) and
-scales horizontally — the API is stateless behind the Postgres primary. A global
+scales horizontally. The API is stateless behind the Postgres primary. A global
 per-IP rate limit (20 req/s, `RATE_LIMIT_RPS`) protects against abuse.
 
 ## Two scalability blockers found & fixed
@@ -63,7 +63,7 @@ feed) serialized **every** matching report into a single JSON array. Reports
 without a `building_id` never collapse via the latest-per-building window, so at
 500k the responses were **89 MB** and **260 MB** respectively.
 
-**Fix:** a `mapPinCap` (5,000, most-recent) on the latest-per-building query
+Fix: a `mapPinCap` (5,000, most-recent) on the latest-per-building query
 (`store.LatestPerBuilding`). Result: **89 MB → 892 KB**, **260 MB → 5.2 MB**.
 Full-density map rendering at scale is served by the clustered **MVT vector-tile**
 endpoint (server-side clustering, 139–911 B/tile); the complete dataset by the
@@ -73,10 +73,10 @@ analyst export path.
 
 The export path loaded the whole result set into a `[]Report` slice and built the
 entire output as one `[]byte`. A single GeoJSON export of 500k peaked at **3.3 GB
-RSS** — a guaranteed OOM on a ~256 MB-free host, despite "export hundreds of
+RSS**, a guaranteed OOM on a ~256 MB-free host, despite "export hundreds of
 thousands of records" being a must-have shown in the video.
 
-**Fix:** the export endpoint now streams from a DB cursor (`store.ExportEach`)
+Fix: the export endpoint now streams from a DB cursor (`store.ExportEach`)
 straight to the HTTP response. Text formats (GeoJSON / CSV / KML) write row-by-row;
 binary containers (GeoPackage / Shapefile) build to a temp file on disk in a single
 pass, then stream out. Dynamic modular columns for CSV/GPKG come from a cheap

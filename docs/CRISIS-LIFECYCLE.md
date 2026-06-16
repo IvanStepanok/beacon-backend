@@ -1,8 +1,8 @@
 # Crisis lifecycle & emergent detection
 
 How a "crisis" comes into existence, how citizen reports attach to it, and what the
-map shows. This is the design that replaced the original behaviour where **a single
-citizen pin instantly surfaced an "active crisis"** — which was wrong both against the
+map shows. This is the design that replaced the original behaviour where a single
+citizen pin instantly surfaced an "active crisis". That was wrong both against the
 challenge requirements (community reports are an *early-signal / verification layer*
 feeding an event, not a declaration of one) and against every competitor (RAPIDA,
 CrisisMapper, Verified Crisis Mapper, CrisisMap, UN-ASIGN all declare a crisis
@@ -11,7 +11,7 @@ admin-side or from an authoritative feed; none let one report conjure one).
 ## The model: a crisis is an EVENT, reports are observations inside it
 
 A **crisis** is a discrete event with a name, an admin-area scope, a time window and a
-lifecycle. **Reports** are observations *inside* an event; they attach to it — they do
+lifecycle. **Reports** are observations *inside* an event; they attach to it. They do
 not, on their own, create one. Within a crisis, data rolls up:
 
 ```
@@ -41,7 +41,7 @@ human confirms (→ `active`) or dismisses it (→ reports released back to pend
 ```
 
 There is **no auto-activation**. (The previous `ActivateIfProposed`, which flipped a
-proposed crisis to active the instant one report was assigned to it, was removed — it
+proposed crisis to active the instant one report was assigned to it, was removed; it
 was the root cause of "one pin = active crisis".) A new report may still *attach* to a
 `proposed` crisis (so the cluster keeps growing and corroboration accumulates for the
 analyst), but attaching never changes the crisis's status.
@@ -52,14 +52,14 @@ When a report matches no existing crisis (`crisis_id` stays NULL) and has a reso
 point, the server checks whether a cluster has formed
 (`store.DetectEmergentCrisis`). A `proposed` crisis is created **only when all** of:
 
-- **≥ N DISTINCT submitters** (`BEACON_EMERGENT_MIN_REPORTS`, default **3**) —
+- **≥ N DISTINCT submitters** (`BEACON_EMERGENT_MIN_REPORTS`, default **3**),
   counted by `count(DISTINCT submitter_id)`, **not** raw rows. Three reports from one
-  device can never propose a crisis. (Anonymous reports with no device id —
-  `submitter_id IS NULL` — do not count toward the distinct gate; they are
+  device can never propose a crisis. (Anonymous reports with no device id,
+  `submitter_id IS NULL`, do not count toward the distinct gate; they are
   un-attributable. The app always sends an `X-Device-Id`, so this is an edge case.)
 - within **`BEACON_EMERGENT_RADIUS_KM`** (default **2.0 km**) of the report,
 - over the last **`BEACON_EMERGENT_WINDOW_HRS`** (default **24 h**),
-- **within ONE admin area** — the cluster is constrained to the report's `adm2_pcode`
+- **within ONE admin area**: the cluster is constrained to the report's `adm2_pcode`
   (preferred) or `adm1_pcode` so a 2 km circle can't merge two districts into one
   event. If the point falls outside all known boundaries (`ResolveAdmin` → nil), it
   falls back to the pure-radius behaviour.
@@ -67,7 +67,7 @@ point, the server checks whether a cluster has formed
 The created crisis is stamped with its admin scope (`crises.admin_pcode`) and the
 **effective thresholds that formed it** (`emergent_radius_km`, `emergent_window_hrs`,
 `emergent_min_reports`) for provenance and future per-crisis tuning. Its title/area
-come from the centroid's admin-area name (`ResolveAdmin`) — **never** a report's
+come from the centroid's admin-area name (`ResolveAdmin`), **never** a report's
 free-text `place` (so client placeholders like "Your location" can't leak into a
 crisis title); the fallback is the centroid coordinates.
 
@@ -85,7 +85,7 @@ BEACON_EMERGENT_MIN_REPORTS=3
 crisis row yet, so there is nothing to read a per-crisis value from. The thresholds are
 therefore a deployment/region default. The effective values are then persisted on the
 crisis row (`crises.emergent_*`), which is the hook for future per-crisis tuning of an
-*existing* crisis (analogous to the existing per-crisis `form_overrides`).
+*existing* crisis (similar to the existing per-crisis `form_overrides`).
 
 ## What the map shows — three states (mobile)
 
@@ -99,33 +99,33 @@ state from the **covering** crisis's `status`:
 | `NO_CRISIS` | no covering crisis | neutral card; reports shown as pins |
 
 `active` wins over `proposed` when both cover the user. A single own report with no
-cluster lands in `NO_CRISIS` (its own pin is still visible) — it never triggers a
+cluster lands in `NO_CRISIS` (its own pin is still visible); it never triggers a
 banner. New strings `map_crisis_emerging` / `map_crisis_emerging_sub` are translated in
 all six UN locales (incl. Arabic RTL).
 
 **EMERGING map data is deliberately viewport-scoped, not crisis-scoped.** A fresh
 `proposed` cluster holds only *pending* reports, and the public/anonymous tier serves
-**verified-only** data — so scoping the map to the proposed crisis id would render an
+**verified-only** data, so scoping the map to the proposed crisis id would render an
 empty map under the banner. Instead the EMERGING state scopes pins to the viewport
 (like `NO_CRISIS`): the contributor still sees their own reports (always merged from
 local state, pre-sync) plus any verified reports nearby, while the amber "awaiting
 verification" banner honestly conveys that the cluster itself is unconfirmed. We do
-**not** relax verified-only for the public tier — broadcasting unverified citizen
+**not** relax verified-only for the public tier; broadcasting unverified citizen
 reports would be a privacy/trust regression.
 
 ## Dashboard
 
 - **Needs review** queue = all `proposed` crises. Each card surfaces the
   **distinct-submitter count** (`distinctSubmitters`, the corroboration/anti-spam
-  signal — 5 reports from 5 devices ≫ 5 from 1) alongside report count, age and a
+  signal, 5 reports from 5 devices ≫ 5 from 1) alongside report count, age and a
   damage-tier mini-breakdown.
 - **Confirm & publish** (→ `active`) is the **only** path from proposed to active;
   Dismiss releases the cluster's reports back to pending.
 - The analyst map's "busiest crisis" auto-default is restricted to `status==='active'`,
-  so an unconfirmed cluster can't silently become the default scope — but proposed
+  so an unconfirmed cluster can't silently become the default scope, but proposed
   crises remain manually selectable for inspection.
 - The **public / community** view resolves `GET /crises/active` and shows verified-only,
-  coarsened aggregates — a `proposed` crisis can never reach the anonymous tier.
+  coarsened aggregates; a `proposed` crisis can never reach the anonymous tier.
 
 ## H3 hotspots & interoperability
 
@@ -138,7 +138,7 @@ portable and feeds both aggregation and export consistently.
 
 - **`GET /reports/area-groups?grid=h3`** returns the hexagonal hotspot view (cell id +
   report centroid + representative place label + count + worst tier). Without `grid=h3`
-  the endpoint keeps the legacy free-text `place` grouping for the textual ranking — both
+  the endpoint keeps the legacy free-text `place` grouping for the textual ranking; both
   views stay available, so existing clients are unaffected.
 - **`h3id`** (HXL `#geo+h3`) is now a column in every export format (CSV / GeoJSON /
   GPKG), the native RAPIDA / GeoHub interoperability key.
@@ -166,8 +166,8 @@ portable and feeds both aggregation and export consistently.
   the mitigations; stronger attestation (e.g. optional phone/community verification, the
   endorsed "trusted contributor" tier) is future work.
 - **Cross-boundary clusters:** a disaster straddling two ADM2 districts forms **two**
-  proposed crises (one per district). This is intentional — it keeps each event cleanly
-  attributable to one admin area for routing/export — and an analyst can keep, merge or
+  proposed crises (one per district). This is intentional (it keeps each event cleanly
+  attributable to one admin area for routing/export), and an analyst can keep, merge or
   dismiss them at review.
 - **`distinctSubmitters` subquery** runs on every crisis list/near/active query. Crisis
   rows are few (not report-scale), and `reports.crisis_id` is indexed, so this mirrors
@@ -175,10 +175,10 @@ portable and feeds both aggregation and export consistently.
 - **Backfill at scale:** `BackfillH3R8` runs in a **background goroutine** at startup
   (never blocks readiness) and works in bounded chunks (2 000-row `LIMIT` SELECT → one
   set-based `UPDATE … FROM unnest(...)` per chunk), so memory stays at one chunk. It is
-  idempotent and resumable — a transient failure just retries on the next boot. On a
+  idempotent and resumable; a transient failure just retries on the next boot. On a
   fresh deploy the reseed already stamps H3 via `UpsertReport`, so the backfill only
   touches non-reseeded legacy rows.
 - **Emergent gate vs pull-in:** the formation gate (distinct-submitter count) and the
-  report pull-in use the **same circle** — centred on the triggering pin, same radius,
-  same admin scope — so exactly the gated reports are attached (the stored crisis
+  report pull-in use the **same circle** (centred on the triggering pin, same radius,
+  same admin scope), so exactly the gated reports are attached (the stored crisis
   centre/geom is the cluster centroid, for display only).
