@@ -124,10 +124,25 @@ func publicProjection(rep model.Report) model.Report {
 	rep.Modular = nil
 	rep.Anonymization = model.Anonymization{}
 
-	// photoUrl is public only for verified reports; otherwise an unverified report's
-	// image (which the photo handler also gates) must not be advertised.
+	// Internal plumbing that must never reach an anonymous caller: the client-generated
+	// idempotency key (correlatable across a device's submissions) and the version-chain
+	// link. capturedAt/createdAt/updatedAt stay — a timestamp on an already-~110m-coarsened
+	// point is not a re-identification vector and the public map uses it for freshness.
+	rep.IdempotencyKey = ""
+	rep.SupersedesReportID = nil
+
+	// photoUrl + photos are public only for verified reports; otherwise an unverified
+	// report's image (which the photo handler also gates) must not be advertised. Even for
+	// verified reports, drop the device-local file path — keep only the servable remoteUrl.
 	if rep.Verification != "verified" {
 		rep.PhotoURL = nil
+		rep.Photos = nil
+	} else {
+		cleaned := make([]model.PhotoRef, len(rep.Photos))
+		for i, p := range rep.Photos {
+			cleaned[i] = model.PhotoRef{RemoteURL: p.RemoteURL}
+		}
+		rep.Photos = cleaned
 	}
 	return rep
 }
