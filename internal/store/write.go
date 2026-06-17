@@ -167,6 +167,40 @@ func UpsertBuilding(ctx context.Context, q querier, b model.Building) error {
 	return err
 }
 
+// UpsertBuildingFootprint loads ONE authoritative building footprint polygon into the
+// buildings table with its real source id + provenance (used by cmd/ingest-footprints).
+// geomJSON is a GeoJSON Polygon or MultiPolygon (RFC 7946, lon,lat); it is normalized to
+// MultiPolygon (same as admin areas) so ST_AsMVTGeom is reliable. The centroid is derived
+// into geom/lat/lng so the existing point-based readers (map pins, /map/features) keep
+// working. ON CONFLICT refreshes the footprint + provenance from the (authoritative)
+// source but PRESERVES any crowd-derived current_damage — a re-ingest must never wipe the
+// damage status the reports have established for that building.
+func UpsertBuildingFootprint(ctx context.Context, q querier, id, crisisID, source, sourceID, version string, geomJSON []byte) error {
+	var crisis any // nullable: empty => unscoped footprint
+	if crisisID != "" {
+		crisis = crisisID
+	}
+	_, err := q.Exec(ctx, `
+		WITH g AS (
+		  SELECT ST_Multi(ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON($6),4326))) AS poly
+		)
+		INSERT INTO buildings (id, crisis_id, footprint, geom, lat, lng, source, source_id, source_version)
+		SELECT $1, $2, g.poly,
+		       ST_Centroid(g.poly), ST_Y(ST_Centroid(g.poly)), ST_X(ST_Centroid(g.poly)),
+		       $3, $4, $5
+		FROM g
+		ON CONFLICT (id) DO UPDATE SET
+		  footprint      = EXCLUDED.footprint,
+		  geom           = COALESCE(EXCLUDED.geom, buildings.geom),
+		  lat            = COALESCE(EXCLUDED.lat, buildings.lat),
+		  lng            = COALESCE(EXCLUDED.lng, buildings.lng),
+		  source         = EXCLUDED.source,
+		  source_id      = EXCLUDED.source_id,
+		  source_version = EXCLUDED.source_version`,
+		id, crisis, source, sourceID, version, string(geomJSON))
+	return err
+}
+
 // NextVersionForBuilding locks the building row, then returns the next version
 // number and the latest prior report id (to be superseded). Call inside a tx.
 func NextVersionForBuilding(ctx context.Context, tx pgx.Tx, buildingID string) (version int, supersedes *string, err error) {

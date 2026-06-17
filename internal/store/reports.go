@@ -633,6 +633,40 @@ func (s *Reports) MapTileMVT(ctx context.Context, z, x, y int, crisisID string, 
 	return mvt, nil
 }
 
+// BuildingTileMVT renders a Mapbox Vector Tile (z/x/y) of authoritative building
+// FOOTPRINT polygons for a crisis — the overlay the reporter and analyst tap to anchor a
+// report to a real building (must-have M2/M9). Mirrors MapTileMVT: scoped by crisis +
+// tile envelope, raw .mvt bytes. The layer is named 'buildings'; each feature carries the
+// building id (bid), the dataset source + source_id, and current_damage, so a tap yields
+// a stable, provenanced building id rather than a hash of a basemap polygon ring.
+// Footprints are public, non-sensitive geometry (the building outline, not a report), so
+// there is no public/analyst tiering. Only emitted at z>=13 — buildings are meaningless
+// at low zoom — returning an empty tile otherwise.
+func (s *Reports) BuildingTileMVT(ctx context.Context, z, x, y int, crisisID string) ([]byte, error) {
+	if z < 13 {
+		return []byte{}, nil
+	}
+	conds := "b.footprint IS NOT NULL AND b.footprint && ST_Transform(env.b3857, 4326)"
+	args := []any{z, x, y}
+	if crisisID != "" {
+		conds += " AND b.crisis_id = $4"
+		args = append(args, crisisID)
+	}
+	sql := `
+		WITH env AS (SELECT ST_TileEnvelope($1,$2,$3) AS b3857),
+		mvtgeom AS (
+		  SELECT ST_AsMVTGeom(ST_Transform(b.footprint,3857), env.b3857, 4096, 16, true) AS geom,
+		         b.id AS bid, b.source, b.source_id, b.current_damage
+		  FROM buildings b, env WHERE ` + conds + `)
+		SELECT COALESCE(ST_AsMVT(mvtgeom.*, 'buildings', 4096, 'geom'), ''::bytea)
+		FROM mvtgeom WHERE geom IS NOT NULL`
+	var mvt []byte
+	if err := s.pool.QueryRow(ctx, sql, args...).Scan(&mvt); err != nil {
+		return nil, err
+	}
+	return mvt, nil
+}
+
 // BuildingTimeline returns the real per-building version history (asc by capture).
 // verifiedOnly restricts the chain to verified entries — the public/anonymous
 // visibility tier — so an anonymous caller can never enumerate pending/flagged

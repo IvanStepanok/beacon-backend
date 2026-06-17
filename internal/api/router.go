@@ -84,6 +84,8 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, h *handler.Handlers, logge
 		r.Get("/map/features", h.MapFeatures)
 		// scalable vector tiles (clusters at low zoom, points at high zoom)
 		r.Get("/tiles/reports/{z}/{x}/{y}", h.ReportTile)
+		// authoritative building-footprint overlay (public; tap-to-anchor with real provenance)
+		r.Get("/tiles/buildings/{z}/{x}/{y}", h.BuildingTile)
 
 		// modular capture-form schema (public: the anonymous mobile app downloads
 		// the Appendix-1 sections, resolved with the crisis's overrides)

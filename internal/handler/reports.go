@@ -240,6 +240,29 @@ func (h *Handlers) ReportTile(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(mvt)
 }
 
+// GET /api/v1/tiles/buildings/{z}/{x}/{y}.mvt?crisisId=
+// Authoritative building-footprint polygons as a vector-tile overlay. Public: a footprint
+// is the building's outline, not a report, so it carries no reporter PII. Layer 'buildings';
+// each feature carries bid/source/source_id so a tap anchors a report to a real building.
+func (h *Handlers) BuildingTile(w http.ResponseWriter, r *http.Request) {
+	z, e1 := strconv.Atoi(chi.URLParam(r, "z"))
+	x, e2 := strconv.Atoi(chi.URLParam(r, "x"))
+	y, e3 := strconv.Atoi(strings.TrimSuffix(chi.URLParam(r, "y"), ".mvt"))
+	if e1 != nil || e2 != nil || e3 != nil || z < 0 || z > 24 {
+		writeErr(w, http.StatusBadRequest, "bad_tile", "invalid z/x/y")
+		return
+	}
+	mvt, err := h.d.Reports.BuildingTileMVT(r.Context(), z, x, y, r.URL.Query().Get("crisisId"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "internal", "tile render failed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.mapbox-vector-tile")
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(mvt)
+}
+
 // GET /api/v1/reports/area-groups[?grid=h3]
 // Public aggregate. For the public tier (anonymous OR external_viewer) the counts
 // cover VERIFIED reports only — mirroring /map/features — so the public page never
