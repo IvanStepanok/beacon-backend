@@ -60,6 +60,7 @@ window), so the demo dataset never goes stale.
 
 ```
 cmd/server         entrypoint: config → migrate → pool → seed → router → graceful shutdown
+cmd/ingest-footprints  CLI: load authoritative building footprints from GeoJSON (operator converts OSM / Open Buildings / gov shapefile via ogr2ogr) — see docs/BUILDING-FOOTPRINTS.md
 internal/config    env-driven config
 internal/db        pgxpool + goose (embedded migrations)
 internal/migrations goose SQL migrations (PostGIS, versioning, RBAC, photo gate, form overrides)
@@ -102,7 +103,7 @@ Row formats carry the required 3-tier damage classification
 | GET | `/api/v1/reports/export?format=geojson\|csv\|gpkg\|kml\|shapefile` | analyst (see Exports) |
 | GET | `/api/v1/buildings/{id}/timeline` | both (public: verified entries, notes stripped) |
 | GET | `/api/v1/map/features?bbox=` | both |
-| GET | `/api/v1/tiles/reports/{z}/{x}/{y}` | both (MVT: clusters at low zoom, points at high zoom) || GET | `/api/v1/form-schema?crisisId=` | mobile (modular capture-form sections, resolved with crisis overrides) |
+| GET | `/api/v1/tiles/reports/{z}/{x}/{y}` | both (MVT: clusters at low zoom, points at high zoom) || GET | `/api/v1/tiles/buildings/{z}/{x}/{y}?crisisId=` | both, public (MVT, layer `buildings`, `store.BuildingTileMVT`); serves real ingested OSM footprints, a tap returns the building id + provenance — see [docs/BUILDING-FOOTPRINTS.md](docs/BUILDING-FOOTPRINTS.md) || GET | `/api/v1/form-schema?crisisId=` | mobile (modular capture-form sections, resolved with crisis overrides) |
 | GET | `/api/v1/stats/overview` | dashboard (analyst, scoped) |
 | GET | `/api/v1/crises`, `/crises/{id}`, `/crises/active`, `/crises/near` | both || PATCH | `/api/v1/crises/{id}/status` | analyst, the ONLY proposed→active path (confirm/dismiss emergent crises; see [docs/CRISIS-LIFECYCLE.md](docs/CRISIS-LIFECYCLE.md)) |
 | PATCH | `/api/v1/crises/{id}/form` | senior analyst (per-crisis form-schema overrides) || GET | `/api/v1/profile` | mobile (points/badges are **server-derived** from verified reports) |
